@@ -1,0 +1,559 @@
+<?php
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With");
+header("Content-Type: application/json; charset=UTF-8");
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit();
+}
+
+require_once __DIR__ . '/config/database.php';
+require_once __DIR__ . '/helpers/jwt_helper.php';
+
+$database = new Database();
+$db = $database->getConnection();
+
+if (!$db) {
+    http_response_code(500);
+    echo json_encode(["success" => false, "message" => "Database connection failed"]);
+    exit();
+}
+
+$headers = getallheaders();
+$authHeader = isset($headers['Authorization']) ? $headers['Authorization'] : '';
+
+if (empty($authHeader)) {
+    http_response_code(401);
+    echo json_encode(["success" => false, "message" => "No token provided"]);
+    exit();
+}
+
+$token = str_replace('Bearer ', '', $authHeader);
+$decoded = JWT::decode($token);
+
+if (!$decoded) {
+    http_response_code(401);
+    echo json_encode(["success" => false, "message" => "Invalid or expired token"]);
+    exit();
+}
+
+$user_id = $decoded['user_id'];
+$method = $_SERVER['REQUEST_METHOD'];
+
+function normalizePaymentStatus($status) {
+    if ($status === null || $status === '') {
+        return 'pending';
+    }
+
+    $status = strtolower(trim($status));
+
+    if ($status === 'partial') {
+        return 'partially_paid';
+    }
+
+    $allowed = ['pending', 'partially_paid', 'paid', 'refunded'];
+    return in_array($status, $allowed, true) ? $status : 'pending';
+}
+
+function createPayment($db, $order_id, $order_code, $amount, $payment_type, $staff_id, $notes = '', $payment_method = 'cash') {
+    if ((float)$amount <= 0) {
+        return true;
+    }
+
+    $payment_code = 'PAY-' . $order_code . '-' . strtoupper($payment_type) . '-' . time();
+
+    $query = "INSERT INTO payments
+              SET payment_code = :payment_code,
+                  order_id = :order_id,
+                  amount = :amount,
+                  payment_method = :payment_method,
+                  payment_status = 'completed',
+                  notes = :notes,
+                  created_by = :created_by,
+                  created_at = NOW(),
+                  updated_at = NOW()";
+
+    $stmt = $db->prepare($query);
+    $stmt->bindParam(':payment_code', $payment_code);
+    $stmt->bindParam(':order_id', $order_id);
+    $stmt->bindParam(':amount', $amount);
+    $stmt->bindParam(':payment_method', $payment_method);
+    $stmt->bindParam(':notes', $notes);
+    $stmt->bindParam(':created_by', $staff_id);
+
+    return $stmt->execute();
+}
+
+function updateOrderPaymentStatus($db, $order_id, $final_cost) {
+    $query = "SELECT COALESCE(SUM(amount), 0) as total_paid
+              FROM payments
+              WHERE order_id = :order_id
+              AND payment_status IN ('completed', 'paid')";
+
+    $stmt = $db->prepare($query);
+    $stmt->bindParam(':order_id', $order_id);
+    $stmt->execute();
+    $result = $stmt->fetch(PDO::FETCH_ASSOC);
+    $total_paid = (float)($result['total_paid'] ?: 0);
+
+    if ($total_paid >= (float)$final_cost && (float)$final_cost > 0) {
+        $payment_status = 'paid';
+    } elseif ($total_paid > 0 && $total_paid < (float)$final_cost) {
+        $payment_status = 'partially_paid';
+    } else {
+        $payment_status = 'pending';
+    }
+
+    $updateQuery = "UPDATE service_orders
+                    SET payment_status = :payment_status,
+                        updated_at = NOW()
+                    WHERE id = :order_id";
+
+    $updateStmt = $db->prepare($updateQuery);
+    $updateStmt->bindParam(':payment_status', $payment_status);
+    $updateStmt->bindParam(':order_id', $order_id);
+
+    return $updateStmt->execute();
+}
+
+function getOrderWithRelations($db, $order_id) {
+    $query = "SELECT so.*,
+                     c.full_name as client_name,
+                     c.email as client_email,
+                     c.phone as client_phone,
+                     c.address as client_address,
+                     p.product_name,
+                     p.brand as product_brand,
+                     p.model as product_model,
+                     p.specifications as product_specifications,
+                     p.serial_number,
+                     u.name as staff_name,
+                     u.email as staff_email
+              FROM service_orders so
+              LEFT JOIN clients c ON so.client_id = c.id
+              LEFT JOIN products p ON so.product_id = p.id
+              LEFT JOIN users u ON so.staff_id = u.id
+              WHERE so.id = :id";
+
+    $stmt = $db->prepare($query);
+    $stmt->bindParam(':id', $order_id);
+    $stmt->execute();
+
+    return $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+try {
+    switch ($method) {
+        case 'GET':
+            $id = isset($_GET['id']) ? $_GET['id'] : null;
+            $search = isset($_GET['search']) ? trim($_GET['search']) : '';
+            $status = isset($_GET['status']) ? trim($_GET['status']) : '';
+            $priority = isset($_GET['priority']) ? trim($_GET['priority']) : '';
+            $start_date = isset($_GET['start_date']) ? trim($_GET['start_date']) : '';
+            $end_date = isset($_GET['end_date']) ? trim($_GET['end_date']) : '';
+
+            if ($id) {
+                $order = getOrderWithRelations($db, $id);
+
+                if (!$order) {
+                    http_response_code(404);
+                    echo json_encode(["success" => false, "message" => "Order not found"]);
+                    exit();
+                }
+
+                $paymentsQuery = "SELECT *
+                                  FROM payments
+                                  WHERE order_id = :order_id
+                                  ORDER BY created_at ASC";
+                $paymentsStmt = $db->prepare($paymentsQuery);
+                $paymentsStmt->bindParam(':order_id', $id);
+                $paymentsStmt->execute();
+                $payments = $paymentsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+                $total_paid = 0;
+                foreach ($payments as $payment) {
+                    if (in_array($payment['payment_status'], ['completed', 'paid'], true)) {
+                        $total_paid += (float)$payment['amount'];
+                    }
+                }
+
+                $final_cost = (float)($order['final_cost'] ?: 0);
+                $balance = $final_cost - $total_paid;
+
+                echo json_encode([
+                    "success" => true,
+                    "order" => $order,
+                    "payments" => $payments,
+                    "payment_summary" => [
+                        "total_paid" => $total_paid,
+                        "final_cost" => $final_cost,
+                        "deposit_amount" => (float)($order['deposit_amount'] ?: 0),
+                        "balance" => $balance
+                    ]
+                ]);
+                exit();
+            }
+
+            $query = "SELECT so.*,
+                             c.full_name as client_name,
+                             c.phone as client_phone,
+                             p.product_name,
+                             p.brand as product_brand,
+                             p.model as product_model,
+                             p.serial_number,
+                             u.name as staff_name,
+                             u.email as staff_email
+                      FROM service_orders so
+                      LEFT JOIN clients c ON so.client_id = c.id
+                      LEFT JOIN products p ON so.product_id = p.id
+                      LEFT JOIN users u ON so.staff_id = u.id
+                      WHERE 1=1";
+
+            $params = [];
+
+            if ($search !== '') {
+                $query .= " AND (
+                    so.order_code LIKE :search OR
+                    c.full_name LIKE :search OR
+                    c.phone LIKE :search OR
+                    p.product_name LIKE :search OR
+                    p.serial_number LIKE :search OR
+                    p.product_code LIKE :search OR
+                    u.name LIKE :search
+                )";
+                $params[':search'] = "%{$search}%";
+            }
+
+            if ($status !== '' && $status !== 'all') {
+                $query .= " AND so.status = :status";
+                $params[':status'] = $status;
+            }
+
+            if ($priority !== '' && $priority !== 'all') {
+                $query .= " AND so.priority = :priority";
+                $params[':priority'] = $priority;
+            }
+
+            if ($start_date !== '' && $end_date !== '') {
+                $query .= " AND DATE(so.created_at) BETWEEN :start_date AND :end_date";
+                $params[':start_date'] = $start_date;
+                $params[':end_date'] = $end_date;
+            }
+
+            $query .= " ORDER BY so.created_at DESC";
+
+            $stmt = $db->prepare($query);
+            $stmt->execute($params);
+            $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            echo json_encode([
+                "success" => true,
+                "orders" => $orders,
+                "count" => count($orders)
+            ]);
+            break;
+
+        case 'POST':
+            $input = json_decode(file_get_contents("php://input"), true);
+
+            if (!$input) {
+                http_response_code(400);
+                echo json_encode(["success" => false, "message" => "Invalid input"]);
+                exit();
+            }
+
+            $required_fields = ['client_id', 'product_id'];
+            foreach ($required_fields as $field) {
+                if (!isset($input[$field]) || $input[$field] === '' || $input[$field] === null) {
+                    http_response_code(400);
+                    echo json_encode(["success" => false, "message" => "Missing required field: {$field}"]);
+                    exit();
+                }
+            }
+
+            $db->beginTransaction();
+
+            try {
+                $order_code = 'ORD' . date('Ymd') . strtoupper(substr(uniqid(), 7, 6));
+
+                $staff_id = isset($input['staff_id']) && $input['staff_id'] !== '' ? (int)$input['staff_id'] : null;
+                $issue_description = isset($input['issue_description']) ? trim($input['issue_description']) : '';
+                $estimated_cost = isset($input['estimated_cost']) && $input['estimated_cost'] !== '' ? (float)$input['estimated_cost'] : 0.00;
+                $final_cost = isset($input['final_cost']) && $input['final_cost'] !== '' ? (float)$input['final_cost'] : $estimated_cost;
+                $deposit_amount = isset($input['deposit_amount']) && $input['deposit_amount'] !== '' ? (float)$input['deposit_amount'] : 0.00;
+
+                $warranty_status = isset($input['warranty_status']) ? $input['warranty_status'] : 'out_of_warranty';
+                $payment_status = normalizePaymentStatus(isset($input['payment_status']) ? $input['payment_status'] : 'pending');
+                $status = isset($input['status']) ? $input['status'] : 'pending';
+                $priority = isset($input['priority']) ? $input['priority'] : 'medium';
+                $estimated_delivery_date = isset($input['estimated_delivery_date']) && trim($input['estimated_delivery_date']) !== '' ? $input['estimated_delivery_date'] : null;
+                $notes = isset($input['notes']) ? $input['notes'] : '';
+
+                $query = "INSERT INTO service_orders
+                          SET order_code = :order_code,
+                              client_id = :client_id,
+                              product_id = :product_id,
+                              staff_id = :staff_id,
+                              issue_description = :issue_description,
+                              warranty_status = :warranty_status,
+                              estimated_cost = :estimated_cost,
+                              final_cost = :final_cost,
+                              deposit_amount = :deposit_amount,
+                              payment_status = :payment_status,
+                              estimated_delivery_date = :estimated_delivery_date,
+                              status = :status,
+                              priority = :priority,
+                              notes = :notes,
+                              created_at = NOW(),
+                              updated_at = NOW()";
+
+                $stmt = $db->prepare($query);
+                $stmt->bindParam(':order_code', $order_code);
+                $stmt->bindParam(':client_id', $input['client_id']);
+                $stmt->bindParam(':product_id', $input['product_id']);
+                $stmt->bindValue(':staff_id', $staff_id, is_null($staff_id) ? PDO::PARAM_NULL : PDO::PARAM_INT);
+                $stmt->bindParam(':issue_description', $issue_description);
+                $stmt->bindParam(':warranty_status', $warranty_status);
+                $stmt->bindParam(':estimated_cost', $estimated_cost);
+                $stmt->bindParam(':final_cost', $final_cost);
+                $stmt->bindParam(':deposit_amount', $deposit_amount);
+                $stmt->bindParam(':payment_status', $payment_status);
+                $stmt->bindValue(':estimated_delivery_date', $estimated_delivery_date, is_null($estimated_delivery_date) ? PDO::PARAM_NULL : PDO::PARAM_STR);
+                $stmt->bindParam(':status', $status);
+                $stmt->bindParam(':priority', $priority);
+                $stmt->bindParam(':notes', $notes);
+
+                if (!$stmt->execute()) {
+                    throw new Exception("Failed to create order");
+                }
+
+                $order_id = $db->lastInsertId();
+
+                if ($deposit_amount > 0) {
+                    if (!createPayment($db, $order_id, $order_code, $deposit_amount, 'DEPOSIT', $user_id, 'Initial deposit for service order')) {
+                        throw new Exception("Failed to create deposit payment");
+                    }
+                }
+
+                if ($payment_status === 'paid' && $final_cost > $deposit_amount) {
+                    $remaining_amount = $final_cost - $deposit_amount;
+                    if ($remaining_amount > 0) {
+                        if (!createPayment($db, $order_id, $order_code, $remaining_amount, 'FINAL', $user_id, 'Final payment for service order')) {
+                            throw new Exception("Failed to create final payment");
+                        }
+                    }
+                }
+
+                updateOrderPaymentStatus($db, $order_id, $final_cost);
+
+                $order = getOrderWithRelations($db, $order_id);
+
+                $paymentsStmt = $db->prepare("SELECT * FROM payments WHERE order_id = :order_id ORDER BY created_at ASC");
+                $paymentsStmt->bindParam(':order_id', $order_id);
+                $paymentsStmt->execute();
+                $payments = $paymentsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+                $total_paid = 0;
+                foreach ($payments as $payment) {
+                    if (in_array($payment['payment_status'], ['completed', 'paid'], true)) {
+                        $total_paid += (float)$payment['amount'];
+                    }
+                }
+
+                $db->commit();
+
+                echo json_encode([
+                    "success" => true,
+                    "message" => "Order created successfully",
+                    "order_id" => $order_id,
+                    "order_code" => $order_code,
+                    "order" => $order,
+                    "payments" => $payments,
+                    "payment_summary" => [
+                        "total_paid" => $total_paid,
+                        "final_cost" => $final_cost,
+                        "deposit_amount" => $deposit_amount,
+                        "balance" => $final_cost - $total_paid
+                    ]
+                ]);
+            } catch (Exception $e) {
+                $db->rollBack();
+                http_response_code(500);
+                echo json_encode([
+                    "success" => false,
+                    "message" => "Failed to create order",
+                    "error" => $e->getMessage()
+                ]);
+            }
+            break;
+
+        case 'PUT':
+            $id = isset($_GET['id']) ? $_GET['id'] : null;
+
+            if (!$id) {
+                http_response_code(400);
+                echo json_encode(["success" => false, "message" => "Order ID required"]);
+                exit();
+            }
+
+            $input = json_decode(file_get_contents("php://input"), true);
+
+            if (!$input) {
+                http_response_code(400);
+                echo json_encode(["success" => false, "message" => "Invalid input"]);
+                exit();
+            }
+
+            $fields = [];
+            $params = [':id' => $id];
+
+            if (isset($input['client_id']) && $input['client_id'] !== '') {
+                $fields[] = 'client_id = :client_id';
+                $params[':client_id'] = $input['client_id'];
+            }
+
+            if (isset($input['product_id']) && $input['product_id'] !== '') {
+                $fields[] = 'product_id = :product_id';
+                $params[':product_id'] = $input['product_id'];
+            }
+
+            if (array_key_exists('staff_id', $input)) {
+                $fields[] = 'staff_id = :staff_id';
+                $params[':staff_id'] = ($input['staff_id'] === '' || $input['staff_id'] === null) ? null : $input['staff_id'];
+            }
+
+            if (isset($input['issue_description'])) {
+                $fields[] = 'issue_description = :issue_description';
+                $params[':issue_description'] = $input['issue_description'];
+            }
+
+            if (isset($input['warranty_status'])) {
+                $fields[] = 'warranty_status = :warranty_status';
+                $params[':warranty_status'] = $input['warranty_status'];
+            }
+
+            if (array_key_exists('estimated_cost', $input)) {
+                $fields[] = 'estimated_cost = :estimated_cost';
+                $params[':estimated_cost'] = ($input['estimated_cost'] === '' || $input['estimated_cost'] === null) ? 0 : $input['estimated_cost'];
+            }
+
+            if (isset($input['final_cost']) && $input['final_cost'] !== '') {
+                $fields[] = 'final_cost = :final_cost';
+                $params[':final_cost'] = $input['final_cost'];
+            }
+
+            if (isset($input['deposit_amount']) && $input['deposit_amount'] !== '') {
+                $fields[] = 'deposit_amount = :deposit_amount';
+                $params[':deposit_amount'] = $input['deposit_amount'];
+            }
+
+            if (isset($input['payment_status'])) {
+                $fields[] = 'payment_status = :payment_status';
+                $params[':payment_status'] = normalizePaymentStatus($input['payment_status']);
+            }
+
+            if (array_key_exists('estimated_delivery_date', $input)) {
+                $fields[] = 'estimated_delivery_date = :estimated_delivery_date';
+                $params[':estimated_delivery_date'] = ($input['estimated_delivery_date'] === '' || $input['estimated_delivery_date'] === null) ? null : $input['estimated_delivery_date'];
+            }
+
+            if (isset($input['status'])) {
+                $fields[] = 'status = :status';
+                $params[':status'] = $input['status'];
+            }
+
+            if (isset($input['priority'])) {
+                $fields[] = 'priority = :priority';
+                $params[':priority'] = $input['priority'];
+            }
+
+            if (isset($input['notes'])) {
+                $fields[] = 'notes = :notes';
+                $params[':notes'] = $input['notes'];
+            }
+
+            $fields[] = 'updated_at = NOW()';
+
+            if (empty($fields)) {
+                http_response_code(400);
+                echo json_encode(["success" => false, "message" => "No fields to update"]);
+                exit();
+            }
+
+            $query = "UPDATE service_orders SET " . implode(', ', $fields) . " WHERE id = :id";
+            $stmt = $db->prepare($query);
+
+            if (!$stmt->execute($params)) {
+                http_response_code(500);
+                echo json_encode(["success" => false, "message" => "Failed to update order"]);
+                exit();
+            }
+
+            $order = getOrderWithRelations($db, $id);
+            if ($order) {
+                updateOrderPaymentStatus($db, $id, (float)($order['final_cost'] ?: 0));
+            }
+
+            echo json_encode([
+                "success" => true,
+                "message" => "Order updated successfully",
+                "order" => getOrderWithRelations($db, $id)
+            ]);
+            break;
+
+        case 'DELETE':
+            $id = isset($_GET['id']) ? $_GET['id'] : null;
+
+            if (!$id) {
+                http_response_code(400);
+                echo json_encode(["success" => false, "message" => "Order ID required"]);
+                exit();
+            }
+
+            $db->beginTransaction();
+
+            try {
+                $deletePaymentsStmt = $db->prepare("DELETE FROM payments WHERE order_id = :order_id");
+                $deletePaymentsStmt->bindParam(':order_id', $id);
+                $deletePaymentsStmt->execute();
+
+                $stmt = $db->prepare("DELETE FROM service_orders WHERE id = :id");
+                $stmt->bindParam(':id', $id);
+
+                if (!$stmt->execute()) {
+                    throw new Exception("Failed to delete order");
+                }
+
+                $db->commit();
+
+                echo json_encode([
+                    "success" => true,
+                    "message" => "Order and related payments deleted successfully"
+                ]);
+            } catch (Exception $e) {
+                $db->rollBack();
+                http_response_code(500);
+                echo json_encode([
+                    "success" => false,
+                    "message" => "Failed to delete order",
+                    "error" => $e->getMessage()
+                ]);
+            }
+            break;
+
+        default:
+            http_response_code(405);
+            echo json_encode(["success" => false, "message" => "Method not allowed"]);
+            break;
+    }
+} catch (Exception $e) {
+    http_response_code(500);
+    echo json_encode([
+        "success" => false,
+        "message" => "Server error",
+        "error" => $e->getMessage()
+    ]);
+}
+?>

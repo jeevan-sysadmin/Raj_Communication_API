@@ -20,8 +20,8 @@ ini_set('display_errors', 1);
 class Database {
     private $host = "localhost";
     private $db_name = "raj communication";
-    private $username = "root";
-    private $password = "";
+    private $username = "jeevan";
+    private $password = "123456";
     public $conn;
 
     public function getConnection() {

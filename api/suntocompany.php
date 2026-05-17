@@ -26,7 +26,7 @@ class Database {
         $candidates = [
             $this->db_name,
             'raj_communication',
-            'sun_computers'
+            'raj communication'
         ];
 
         foreach ($candidates as $dbName) {

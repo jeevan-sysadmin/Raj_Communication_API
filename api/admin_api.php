@@ -1,5 +1,5 @@
 <?php
-// C:\xampp\htdocs\sun_computers\api\admin_api.php
+// C:\xampp\htdocs\raj communication\api\admin_api.php
 
 // Enable CORS
 header("Access-Control-Allow-Origin: *");

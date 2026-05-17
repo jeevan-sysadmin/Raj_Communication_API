@@ -21,7 +21,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
 // SIMPLE PATH FIX - Just create the Database class inline
 class Database {
     private $host = "localhost";
-    private $db_name = "sun_computers";
+    private $db_name = "raj communication";
     private $username = "root";
     private $password = "";
     public $conn;

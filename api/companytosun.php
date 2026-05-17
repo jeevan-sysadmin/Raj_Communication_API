@@ -26,7 +26,7 @@ class Database {
         $candidates = [
             $this->db_name,
             'raj_communication',
-            'sun_computers'
+            'raj communication'
         ];
 
         foreach ($candidates as $dbName) {
@@ -53,7 +53,7 @@ class Database {
         echo json_encode([
             "success" => false,
             "message" => "Database connection failed",
-            "error" => "No matching database found (checked: raj communication, raj_communication, sun_computers)"
+            "error" => "No matching database found (checked: raj communication, raj_communication, raj communication)"
         ]);
         exit();
     }

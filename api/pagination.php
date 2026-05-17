@@ -13,7 +13,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 // Database configuration
 class Database {
     private $host = "localhost";
-    private $db_name = "sun_computers";
+    private $db_name = "raj communication";
     private $username = "root";
     private $password = "";
     public $conn;

@@ -15,7 +15,7 @@ ini_set('display_errors', 1);
 
 class Database {
     private $host = "localhost";
-    private $db_name = "sun_computers";
+    private $db_name = "raj communication";
     private $username = "root";
     private $password = "";
     public $conn;

@@ -104,8 +104,8 @@ function normalizeProductPayloadAliases($row) {
 class Database {
     private $host = "localhost";
     private $db_name = "raj communication";
-    private $username = "jeevan";
-    private $password = "123456";
+    private $username = "root";
+    private $password = "";
     public $conn;
 
     public function getConnection() {
@@ -135,7 +135,7 @@ class Product {
     // Valid claim types
     private $valid_claim_types = ['none', 'shop_claim', 'company_claim', 'sun_to_company', 'company_to_sun'];
     private $valid_categories = ['cctv', 'harddisk', 'DVR', 'wificamer', 'others'];
-    private $valid_statuses = ['active', 'inactive', 'discontinued', 'out_of_stock'];
+    private $valid_statuses = ['active', 'handover'];
 
     public $id;
     public $product_code;
@@ -462,12 +462,12 @@ class Product {
         $result = $checkStmt->fetch();
         
         if ($result && $result['order_count'] > 0) {
-            // Product has orders, mark as discontinued instead of deleting
-            $query = "UPDATE " . $this->table . " SET status = 'discontinued', updated_at = NOW() WHERE id = :id";
+            // Product has orders, mark as handover instead of deleting
+            $query = "UPDATE " . $this->table . " SET status = 'handover', updated_at = NOW() WHERE id = :id";
             $stmt = $this->conn->prepare($query);
             $stmt->bindParam(':id', $this->id);
             if($stmt->execute()) {
-                return ['success' => true, 'message' => 'Product has associated orders. Status changed to discontinued'];
+                return ['success' => true, 'message' => 'Product has associated orders. Status changed to handover'];
             }
             return ['success' => false, 'message' => 'Failed to update product status'];
         } else {

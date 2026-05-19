@@ -14,14 +14,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
 
 // Error reporting for development
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
+// Keep API responses valid JSON (log errors, don't print HTML notices/warnings)
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
 
 // Database Configuration
 class Database {
     private $host = "localhost";
     private $db_name = "raj communication";
-    private $username = "jeevan";
-    private $password = "123456";
+    private $username = "root";
+    private $password = "";
     public $conn;
 
     public function getConnection() {
@@ -155,6 +157,34 @@ function normalizeDeliveryType($value) {
         return 'parcelservice';
     }
     return 'inhand';
+}
+
+function isValidDeliveryType($value) {
+    return in_array((string)$value, ['inhand', 'courier', 'parcelservice'], true);
+}
+
+function normalizeDeliveryTypeRowsInDatabase($conn) {
+    try {
+        $conn->exec("
+            UPDATE deliveries
+            SET delivery_type = 'inhand'
+            WHERE delivery_type IS NULL
+               OR delivery_type = ''
+               OR delivery_type = 'in_hand'
+               OR delivery_type = 'pickup'
+        ");
+
+        $conn->exec("
+            UPDATE deliveries
+            SET delivery_type = 'parcelservice'
+            WHERE delivery_type = 'parcel_service'
+               OR delivery_type = 'delivery'
+               OR delivery_type = 'home_delivery'
+        ");
+    } catch (Exception $e) {
+        // Do not block API if cleanup fails; requests can still proceed.
+        error_log('Delivery type normalization failed: ' . $e->getMessage());
+    }
 }
 
 function hasDeliveredProductStatus($statusMapRaw) {
@@ -294,6 +324,9 @@ function syncDeliveredProductStatusToDeliveries($conn) {
  */
 function getDeliveries($conn) {
     try {
+        // Keep DB values aligned to enum-safe values before reads.
+        normalizeDeliveryTypeRowsInDatabase($conn);
+
         if (isset($_GET['id']) && !empty($_GET['id'])) {
             $query = "SELECT d.*,
                              COALESCE(NULLIF(d.delivery_type, ''), 'inhand') AS delivery_type,
@@ -317,6 +350,7 @@ function getDeliveries($conn) {
             $delivery = $stmt->fetch(PDO::FETCH_ASSOC);
 
             if ($delivery) {
+                $delivery['delivery_type'] = normalizeDeliveryType($delivery['delivery_type'] ?? '');
                 echo json_encode([
                     'success' => true,
                     'delivery' => $delivery
@@ -443,10 +477,14 @@ function getDeliveries($conn) {
  */
 function createDelivery($conn) {
     try {
+        // Ensure legacy values are normalized before insert flow.
+        normalizeDeliveryTypeRowsInDatabase($conn);
+
         $data = json_decode(file_get_contents("php://input"), true);
         
         // If no JSON data, check form data
-        if (empty($data) && $_SERVER['CONTENT_TYPE'] === 'application/x-www-form-urlencoded') {
+        $contentType = isset($_SERVER['CONTENT_TYPE']) ? strtolower((string)$_SERVER['CONTENT_TYPE']) : '';
+        if (empty($data) && strpos($contentType, 'application/x-www-form-urlencoded') !== false) {
             $data = $_POST;
         }
         
@@ -509,6 +547,14 @@ function createDelivery($conn) {
         $stmt->bindParam(':order_id', $data['order_id'], PDO::PARAM_INT);
         $stmt->bindParam(':delivery_code', $delivery_code);
         $deliveryType = normalizeDeliveryType($data['delivery_type']);
+        if (!isValidDeliveryType($deliveryType)) {
+            http_response_code(400);
+            echo json_encode([
+                'success' => false,
+                'message' => 'Invalid delivery_type. Allowed: inhand, courier, parcelservice'
+            ]);
+            return;
+        }
         $stmt->bindParam(':delivery_type', $deliveryType);
         $stmt->bindParam(':address', $data['address']);
         $stmt->bindParam(':contact_person', $data['contact_person']);
@@ -571,6 +617,9 @@ function createDelivery($conn) {
  */
 function updateDelivery($conn) {
     try {
+        // Ensure legacy values are normalized before update flow.
+        normalizeDeliveryTypeRowsInDatabase($conn);
+
         $rawInput = file_get_contents("php://input");
         $data = json_decode($rawInput, true);
         if (!is_array($data)) {
@@ -631,6 +680,14 @@ function updateDelivery($conn) {
             if (isset($data[$field])) {
                 if ($field === 'delivery_type') {
                     $data[$field] = normalizeDeliveryType($data[$field]);
+                    if (!isValidDeliveryType($data[$field])) {
+                        http_response_code(400);
+                        echo json_encode([
+                            'success' => false,
+                            'message' => 'Invalid delivery_type. Allowed: inhand, courier, parcelservice'
+                        ]);
+                        return;
+                    }
                 }
                 $fields[] = "{$field} = :{$field}";
                 $params[":{$field}"] = $data[$field];

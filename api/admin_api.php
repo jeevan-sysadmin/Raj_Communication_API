@@ -1,5 +1,5 @@
 <?php
-// C:\xampp\htdocs\raj communication\api\admin_api.php
+// C:\xampp\htdocs\sun_computers\api\admin_api.php
 
 // Enable CORS
 header("Access-Control-Allow-Origin: *");
@@ -2435,13 +2435,11 @@ class AdminAPI {
 
                 $query = "INSERT INTO products (
                             product_code, serial_number, is_spare_product, product_name, brand, model, category,
-                            claim_type, specifications, purchase_date, warranty_period, price, stock_quantity,
-                            min_stock_level, status, created_at
+                            claim_type, specifications, purchase_date, warranty_period, price, status, created_at
                           )
                           VALUES (
                             :product_code, :serial_number, :is_spare_product, :product_name, :brand, :model, :category,
-                            :claim_type, :specifications, :purchase_date, :warranty_period, :price, :stock_quantity,
-                            :min_stock_level, :status, NOW()
+                            :claim_type, :specifications, :purchase_date, :warranty_period, :price, :status, NOW()
                           )";
 
                 $stmt = $this->conn->prepare($query);
@@ -2457,8 +2455,6 @@ class AdminAPI {
                 $stmt->bindValue(':purchase_date', isset($row['purchase_date']) && trim((string)$row['purchase_date']) !== '' ? $row['purchase_date'] : date('Y-m-d'), PDO::PARAM_STR);
                 $stmt->bindValue(':warranty_period', isset($row['warranty_period']) && trim((string)$row['warranty_period']) !== '' ? trim((string)$row['warranty_period']) : '1 year', PDO::PARAM_STR);
                 $stmt->bindValue(':price', isset($row['price']) ? (float)$row['price'] : 0);
-                $stmt->bindValue(':stock_quantity', isset($row['stock_quantity']) ? (int)$row['stock_quantity'] : 0, PDO::PARAM_INT);
-                $stmt->bindValue(':min_stock_level', isset($row['min_stock_level']) ? (int)$row['min_stock_level'] : 5, PDO::PARAM_INT);
                 $stmt->bindValue(':status', $status, PDO::PARAM_STR);
 
                 if (!$stmt->execute()) {
@@ -2629,8 +2625,6 @@ class AdminAPI {
                          purchase_date = :purchase_date,
                          warranty_period = :warranty_period,
                          price = :price,
-                         stock_quantity = :stock_quantity,
-                         min_stock_level = :min_stock_level,
                          status = :status,
                          updated_at = NOW()
                      WHERE id = :id";
@@ -2648,8 +2642,6 @@ class AdminAPI {
             $stmt->bindValue(':purchase_date', isset($data['purchase_date']) && trim((string)$data['purchase_date']) !== '' ? $data['purchase_date'] : ($existingProduct['purchase_date'] ?? date('Y-m-d')), PDO::PARAM_STR);
             $stmt->bindValue(':warranty_period', isset($data['warranty_period']) && trim((string)$data['warranty_period']) !== '' ? trim((string)$data['warranty_period']) : (string)($existingProduct['warranty_period'] ?? '1 year'), PDO::PARAM_STR);
             $stmt->bindValue(':price', isset($data['price']) ? (float)$data['price'] : (float)($existingProduct['price'] ?? 0));
-            $stmt->bindValue(':stock_quantity', isset($data['stock_quantity']) ? (int)$data['stock_quantity'] : (int)($existingProduct['stock_quantity'] ?? 0), PDO::PARAM_INT);
-            $stmt->bindValue(':min_stock_level', isset($data['min_stock_level']) ? (int)$data['min_stock_level'] : (int)($existingProduct['min_stock_level'] ?? 5), PDO::PARAM_INT);
             $stmt->bindValue(':status', $status, PDO::PARAM_STR);
             
             if ($stmt->execute()) {

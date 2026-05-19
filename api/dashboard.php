@@ -57,7 +57,7 @@ try {
 
 // Get the actual request URI
 $request_uri = $_SERVER['REQUEST_URI'];
-$base_path = '/sun_computers/api/dashboard';
+$base_path = '/raj communication/api/dashboard';
 $path = str_replace($base_path, '', $request_uri);
 $path = trim($path, '/');
 $path_parts = $path ? explode('/', $path) : [];

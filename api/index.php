@@ -16,7 +16,7 @@ $method = $_SERVER['REQUEST_METHOD'];
 $request_uri = $_SERVER['REQUEST_URI'];
 
 // Parse the URI to get endpoint
-$base_path = '/raj communication/api';
+$base_path = '/raj_communication/api';
 $path = parse_url($request_uri, PHP_URL_PATH);
 $path = str_replace($base_path, '', $path);
 $path = trim($path, '/');

@@ -1,5 +1,5 @@
 <?php
-// C:\xampp\htdocs\raj communication\api\image_upload.php
+// C:\xampp\htdocs\raj_communication\api\image_upload.php
 
 // Enable CORS
 header("Access-Control-Allow-Origin: *");
@@ -197,7 +197,7 @@ class ImageUpload {
     private function getImageUrl($filename) {
         $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http';
         $host = $_SERVER['HTTP_HOST'];
-        $base_url = $protocol . '://' . $host . '/raj communication/uploads/profile_images/';
+        $base_url = $protocol . '://' . $host . '/raj_communication/uploads/profile_images/';
         return $base_url . $filename;
     }
     

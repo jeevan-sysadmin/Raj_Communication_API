@@ -1,5 +1,5 @@
 <?php
-// C:\xampp\htdocs\raj communication\api\reset_password.php
+// C:\xampp\htdocs\raj_communication\api\reset_password.php
 
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: POST, OPTIONS");

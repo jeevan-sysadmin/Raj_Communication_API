@@ -1,4 +1,4 @@
-﻿<?php
+<?php
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With");
@@ -415,6 +415,27 @@ function normalizeRepairingStatusMap($value) {
     return $normalized;
 }
 
+function normalizeIssueDescriptionMap($value) {
+    if ($value === null || $value === '') return [];
+    $parsed = $value;
+    if (is_string($value)) {
+        $decoded = json_decode($value, true);
+        if (json_last_error() === JSON_ERROR_NONE) {
+            $parsed = $decoded;
+        } else {
+            return [];
+        }
+    }
+    if (!is_array($parsed)) return [];
+    $normalized = [];
+    foreach ($parsed as $productId => $issueText) {
+        $pid = (int)$productId;
+        if ($pid <= 0) continue;
+        $normalized[(string)$pid] = trim((string)$issueText);
+    }
+    return $normalized;
+}
+
 function isPreviewModeRequest($input) {
     if (!is_array($input)) return false;
     if (isset($_GET['preview']) && ($_GET['preview'] === '1' || strtolower((string)$_GET['preview']) === 'true')) {
@@ -528,6 +549,29 @@ function ensureServiceOrderProductStatusDatesColumn($db, $orderColumns) {
         }
     }
     return $added ? fetchTableColumns($db, 'service_orders', true) : $orderColumns;
+}
+
+function ensureServiceOrderIssueDescriptionMapColumn($db, $orderColumns) {
+    if (!isset($orderColumns['issue_description_map'])) {
+        try {
+            $db->exec("ALTER TABLE service_orders ADD COLUMN issue_description_map LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '{}' CHECK (json_valid(issue_description_map)) AFTER repairing_status_map");
+            return fetchTableColumns($db, 'service_orders', true);
+        } catch (Exception $e) {
+            return fetchTableColumns($db, 'service_orders', true);
+        }
+    }
+    return $orderColumns;
+}
+
+function ensureLegacyIssueDescriptionColumnIsOptional($db, $orderColumns) {
+    if (!isset($orderColumns['issue_description'])) return $orderColumns;
+    try {
+        // Legacy compatibility: old schemas may still require issue_description.
+        $db->exec("ALTER TABLE service_orders MODIFY COLUMN issue_description TEXT NULL DEFAULT NULL");
+        return fetchTableColumns($db, 'service_orders', true);
+    } catch (Exception $e) {
+        return $orderColumns;
+    }
 }
 
 function splitProductStatusDatesByStatus($datesMap, $productIds = []) {
@@ -1179,7 +1223,6 @@ try {
                 $staff_id = isset($input['staff_id']) && $input['staff_id'] !== '' ? (int)$input['staff_id'] : null;
                 $primary_product_id = $product_ids[0];
                 $primary_replacement_product_id = !empty($replacement_product_ids) ? (int)$replacement_product_ids[0] : null;
-                $issue_description = isset($input['issue_description']) ? trim($input['issue_description']) : '';
                 $estimated_cost = isset($input['estimated_cost']) && $input['estimated_cost'] !== '' ? (float)$input['estimated_cost'] : 0.00;
                 $final_cost = isset($input['final_cost']) && $input['final_cost'] !== '' ? (float)$input['final_cost'] : $estimated_cost;
                 $deposit_amount = isset($input['deposit_amount']) && $input['deposit_amount'] !== '' ? (float)$input['deposit_amount'] : 0.00;
@@ -1201,17 +1244,22 @@ try {
                 $orderColumns = ensureServiceOrderHandoverColumns($db, $orderColumns);
                 $orderColumns = ensureServiceOrderRepairingStatusColumn($db, $orderColumns);
                 $orderColumns = ensureServiceOrderProductStatusDatesColumn($db, $orderColumns);
+                $orderColumns = ensureServiceOrderIssueDescriptionMapColumn($db, $orderColumns);
+                $orderColumns = ensureLegacyIssueDescriptionColumnIsOptional($db, $orderColumns);
                 $hasOrderColumns = !empty($orderColumns);
                 $hasCompanyIdColumn = $hasOrderColumns && isset($orderColumns['company_id']);
                 $hasCompanyIdsColumn = $hasOrderColumns && isset($orderColumns['company_ids']);
+                $hasCompaniesProductsColumn = $hasOrderColumns && isset($orderColumns['companies_products']);
                 $hasCompanyProductMapColumn = $hasOrderColumns && isset($orderColumns['company_product_map']);
                 $hasProductStatusMapColumn = $hasOrderColumns && isset($orderColumns['product_status_map']);
                 $hasProductStatusDatesMapColumn = $hasOrderColumns && isset($orderColumns['product_status_dates_map']);
+                $hasLegacyIssueDescriptionColumn = $hasOrderColumns && isset($orderColumns['issue_description']);
                 $hasPendingDatesColumn = $hasOrderColumns && isset($orderColumns['pending_dates']);
                 $hasRajtocomDatesColumn = $hasOrderColumns && isset($orderColumns['rajtocom_dates']);
                 $hasComtorajDatesColumn = $hasOrderColumns && isset($orderColumns['comtoraj_dates']);
                 $hasDeliveryedDatesColumn = $hasOrderColumns && isset($orderColumns['deliveryed_dates']);
                 $hasRepairingStatusMapColumn = $hasOrderColumns && isset($orderColumns['repairing_status_map']);
+                $hasIssueDescriptionMapColumn = $hasOrderColumns && isset($orderColumns['issue_description_map']);
                 $hasHandoverTypeColumn = $hasOrderColumns && isset($orderColumns['handover_type']);
                 $hasHandoverTypeMapColumn = $hasOrderColumns && isset($orderColumns['handover_type_map']);
                 $company_ids = normalizeIdList($input['company_ids'] ?? ($input['company_id'] ?? null));
@@ -1220,10 +1268,11 @@ try {
                     return isset($companyNamesMap[(int)$companyId]);
                 }));
                 $company_id = !empty($company_ids) ? (int)$company_ids[0] : null;
-                $company_product_map = normalizeCompanyProductMap($input['company_product_map'] ?? null);
+                $company_product_map = normalizeCompanyProductMap($input['company_product_map'] ?? ($input['companies_products'] ?? null));
                 $incoming_product_status_map = normalizeProductStatusMap($input['product_status_map'] ?? null);
                 $incoming_product_status_dates_map = normalizeProductStatusDatesMap($input['product_status_dates_map'] ?? null);
                 $incoming_repairing_status_map = normalizeRepairingStatusMap($input['repairing_status_map'] ?? null);
+                $incoming_issue_description_map = normalizeIssueDescriptionMap($input['issue_description_map'] ?? null);
                 $normalized_company_product_map = [];
                 if (!empty($company_ids)) {
                     if (empty($company_product_map)) {
@@ -1257,6 +1306,7 @@ try {
                 $primary_product_id = $product_ids[0];
                 $product_ids_json = json_encode($product_ids);
                 $company_ids_json = !empty($company_ids) ? json_encode($company_ids) : null;
+                $companies_products_json = !empty($normalized_company_product_map) ? json_encode($normalized_company_product_map) : null;
                 $company_product_map_json = !empty($normalized_company_product_map) ? json_encode($normalized_company_product_map) : null;
                 $normalized_product_status_map = [];
                 foreach ($product_ids as $product_id) {
@@ -1302,6 +1352,22 @@ try {
                         : 'not ready';
                 }
                 $repairing_status_map_json = !empty($normalized_repairing_status_map) ? json_encode($normalized_repairing_status_map) : '{}';
+                $normalized_issue_description_map = [];
+                foreach ($product_ids as $product_id) {
+                    $key = (string)$product_id;
+                    $normalized_issue_description_map[$key] = isset($incoming_issue_description_map[$key])
+                        ? trim((string)$incoming_issue_description_map[$key])
+                        : '';
+                }
+                $issue_description_map_json = !empty($normalized_issue_description_map) ? json_encode($normalized_issue_description_map) : '{}';
+                $legacy_issue_description_value = 'N/A';
+                foreach ($normalized_issue_description_map as $issueText) {
+                    $candidate = trim((string)$issueText);
+                    if ($candidate !== '') {
+                        $legacy_issue_description_value = $candidate;
+                        break;
+                    }
+                }
                 $incoming_handover_type_map = normalizeHandoverTypeMap($input['handover_type_map'] ?? null);
                 $normalized_handover_type_map = [];
                 foreach ($product_ids as $product_id) {
@@ -1345,8 +1411,7 @@ try {
                     'replacement_product_id = :replacement_product_id',
                     'replacement_product_ids = :replacement_product_ids',
                     'staff_id = :staff_id',
-                    'issue_description = :issue_description',
-                    'warranty_status = :warranty_status',
+                                        'warranty_status = :warranty_status',
                     'estimated_cost = :estimated_cost',
                     'final_cost = :final_cost',
                     'deposit_amount = :deposit_amount',
@@ -1364,7 +1429,9 @@ try {
                 if ($hasOrderColumns && isset($orderColumns['priority'])) $orderAssignments[] = 'priority = :priority';
                 if ($hasCompanyIdColumn) $orderAssignments[] = 'company_id = :company_id';
                 if ($hasCompanyIdsColumn) $orderAssignments[] = 'company_ids = :company_ids';
+                if ($hasCompaniesProductsColumn) $orderAssignments[] = 'companies_products = :companies_products';
                 if ($hasCompanyProductMapColumn) $orderAssignments[] = 'company_product_map = :company_product_map';
+                if ($hasLegacyIssueDescriptionColumn) $orderAssignments[] = 'issue_description = :legacy_issue_description';
                 if ($hasProductStatusMapColumn) $orderAssignments[] = 'product_status_map = :product_status_map';
                 if ($hasProductStatusDatesMapColumn) $orderAssignments[] = 'product_status_dates_map = :product_status_dates_map';
                 if ($hasPendingDatesColumn) $orderAssignments[] = 'pending_dates = :pending_dates';
@@ -1372,6 +1439,7 @@ try {
                 if ($hasComtorajDatesColumn) $orderAssignments[] = 'comtoraj_dates = :comtoraj_dates';
                 if ($hasDeliveryedDatesColumn) $orderAssignments[] = 'deliveryed_dates = :deliveryed_dates';
                 if ($hasRepairingStatusMapColumn) $orderAssignments[] = 'repairing_status_map = :repairing_status_map';
+                if ($hasIssueDescriptionMapColumn) $orderAssignments[] = 'issue_description_map = :issue_description_map';
                 if ($hasHandoverTypeColumn) $orderAssignments[] = 'handover_type = :handover_type';
                 if ($hasHandoverTypeMapColumn) $orderAssignments[] = 'handover_type_map = :handover_type_map';
                 $query = "INSERT INTO service_orders SET " . implode(', ', $orderAssignments);
@@ -1384,7 +1452,6 @@ try {
                 $stmt->bindValue(':replacement_product_ids', $replacement_product_ids_json, is_null($replacement_product_ids_json) ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 $stmt->bindValue(':staff_id', $staff_id, is_null($staff_id) ? PDO::PARAM_NULL : PDO::PARAM_INT);
                 if ($hasOrderColumns && isset($orderColumns['service_type'])) $stmt->bindParam(':service_type', $service_type);
-                $stmt->bindParam(':issue_description', $issue_description);
                 $stmt->bindParam(':warranty_status', $warranty_status);
                 $stmt->bindParam(':estimated_cost', $estimated_cost);
                 $stmt->bindParam(':final_cost', $final_cost);
@@ -1399,7 +1466,9 @@ try {
                 if ($hasOrderColumns && isset($orderColumns['rating'])) $stmt->bindValue(':rating', $rating, $rating === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
                 if ($hasCompanyIdColumn) $stmt->bindValue(':company_id', $company_id, $company_id === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
                 if ($hasCompanyIdsColumn) $stmt->bindValue(':company_ids', $company_ids_json, $company_ids_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+                if ($hasCompaniesProductsColumn) $stmt->bindValue(':companies_products', $companies_products_json, $companies_products_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if ($hasCompanyProductMapColumn) $stmt->bindValue(':company_product_map', $company_product_map_json, $company_product_map_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+                if ($hasLegacyIssueDescriptionColumn) $stmt->bindValue(':legacy_issue_description', $legacy_issue_description_value, PDO::PARAM_STR);
                 if ($hasProductStatusMapColumn) $stmt->bindValue(':product_status_map', $product_status_map_json, $product_status_map_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if ($hasProductStatusDatesMapColumn) {
                     if ($product_status_dates_map_json === null || $product_status_dates_map_json === '{}' || $product_status_dates_map_json === 'null') {
@@ -1413,6 +1482,7 @@ try {
                 if ($hasComtorajDatesColumn) $stmt->bindValue(':comtoraj_dates', $comtoraj_dates_json, $comtoraj_dates_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if ($hasDeliveryedDatesColumn) $stmt->bindValue(':deliveryed_dates', $deliveryed_dates_json, $deliveryed_dates_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if ($hasRepairingStatusMapColumn) $stmt->bindValue(':repairing_status_map', $repairing_status_map_json, $repairing_status_map_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+                if ($hasIssueDescriptionMapColumn) $stmt->bindValue(':issue_description_map', $issue_description_map_json, $issue_description_map_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if ($hasHandoverTypeColumn) $stmt->bindValue(':handover_type', $handover_type, $handover_type === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if ($hasHandoverTypeMapColumn) $stmt->bindValue(':handover_type_map', $handover_type_map_json, $handover_type_map_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if (!$stmt->execute()) throw new Exception("Failed to create order");
@@ -1533,6 +1603,8 @@ try {
             $orderColumns = ensureServiceOrderHandoverColumns($db, $orderColumns);
             $orderColumns = ensureServiceOrderRepairingStatusColumn($db, $orderColumns);
             $orderColumns = ensureServiceOrderProductStatusDatesColumn($db, $orderColumns);
+            $orderColumns = ensureServiceOrderIssueDescriptionMapColumn($db, $orderColumns);
+            $orderColumns = ensureLegacyIssueDescriptionColumnIsOptional($db, $orderColumns);
             $hasOrderColumns = !empty($orderColumns);
             if (isset($input['client_id']) && $input['client_id'] !== '') {
                 $fields[] = 'client_id = :client_id';
@@ -1565,6 +1637,7 @@ try {
             }
             $hasCompanyIdColumn = $hasOrderColumns && isset($orderColumns['company_id']);
             $hasCompanyIdsColumn = $hasOrderColumns && isset($orderColumns['company_ids']);
+            $hasCompaniesProductsColumn = $hasOrderColumns && isset($orderColumns['companies_products']);
             $hasCompanyProductMapColumn = $hasOrderColumns && isset($orderColumns['company_product_map']);
             $hasProductStatusMapColumn = $hasOrderColumns && isset($orderColumns['product_status_map']);
             $hasProductStatusDatesMapColumn = $hasOrderColumns && isset($orderColumns['product_status_dates_map']);
@@ -1573,6 +1646,8 @@ try {
             $hasComtorajDatesColumn = $hasOrderColumns && isset($orderColumns['comtoraj_dates']);
             $hasDeliveryedDatesColumn = $hasOrderColumns && isset($orderColumns['deliveryed_dates']);
             $hasRepairingStatusMapColumn = $hasOrderColumns && isset($orderColumns['repairing_status_map']);
+            $hasLegacyIssueDescriptionColumn = $hasOrderColumns && isset($orderColumns['issue_description']);
+            $hasIssueDescriptionMapColumn = $hasOrderColumns && isset($orderColumns['issue_description_map']);
             $hasHandoverTypeColumn = $hasOrderColumns && isset($orderColumns['handover_type']);
             $hasHandoverTypeMapColumn = $hasOrderColumns && isset($orderColumns['handover_type_map']);
             
@@ -1588,13 +1663,15 @@ try {
             }
             
             $companyIdsProvided = array_key_exists('company_ids', $input) || array_key_exists('company_id', $input);
-            $companyProductMapProvided = array_key_exists('company_product_map', $input);
+            $companyProductMapProvided = array_key_exists('company_product_map', $input) || array_key_exists('companies_products', $input);
             if ($hasCompanyIdColumn || $hasCompanyIdsColumn || $hasCompanyProductMapColumn) {
                 $company_ids = [];
                 if ($companyIdsProvided) {
                     $company_ids = normalizeIdList($input['company_ids'] ?? ($input['company_id'] ?? null));
                 }
-                $company_product_map = $companyProductMapProvided ? normalizeCompanyProductMap($input['company_product_map']) : [];
+                $company_product_map = $companyProductMapProvided
+                    ? normalizeCompanyProductMap($input['company_product_map'] ?? ($input['companies_products'] ?? null))
+                    : [];
                 if (!$companyIdsProvided && $companyProductMapProvided) {
                     $company_ids = normalizeIdList(array_keys($company_product_map));
                 }
@@ -1650,6 +1727,10 @@ try {
                         $fields[] = 'company_product_map = :company_product_map';
                         $params[':company_product_map'] = !empty($normalized_company_product_map) ? json_encode($normalized_company_product_map) : null;
                     }
+                    if ($hasCompaniesProductsColumn) {
+                        $fields[] = 'companies_products = :companies_products';
+                        $params[':companies_products'] = !empty($normalized_company_product_map) ? json_encode($normalized_company_product_map) : null;
+                    }
                 } elseif ($companyIdsProvided || $companyProductMapProvided) {
                     if ($hasCompanyIdColumn) {
                         $fields[] = 'company_id = :company_id';
@@ -1663,15 +1744,15 @@ try {
                         $fields[] = 'company_product_map = :company_product_map';
                         $params[':company_product_map'] = null;
                     }
+                    if ($hasCompaniesProductsColumn) {
+                        $fields[] = 'companies_products = :companies_products';
+                        $params[':companies_products'] = null;
+                    }
                 }
             }
             if ($hasOrderColumns && isset($orderColumns['service_type']) && isset($input['service_type'])) {
                 $fields[] = 'service_type = :service_type';
                 $params[':service_type'] = trim((string)$input['service_type']) !== '' ? trim((string)$input['service_type']) : 'general';
-            }
-            if (isset($input['issue_description'])) {
-                $fields[] = 'issue_description = :issue_description';
-                $params[':issue_description'] = $input['issue_description'];
             }
             if ($hasOrderColumns && isset($orderColumns['diagnosis_notes']) && array_key_exists('diagnosis_notes', $input)) {
                 $fields[] = 'diagnosis_notes = :diagnosis_notes';
@@ -1927,6 +2008,56 @@ try {
                 $normalizedRepairingStatusMapJson = !empty($statusMap) ? json_encode($statusMap) : '{}';
                 $params[':repairing_status_map'] = $normalizedRepairingStatusMapJson;
             }
+
+            if ($hasIssueDescriptionMapColumn && array_key_exists('issue_description_map', $input)) {
+                $issueMap = normalizeIssueDescriptionMap($input['issue_description_map']);
+                $targetProductIds = [];
+                if (is_array($update_product_ids) && !empty($update_product_ids)) {
+                    $targetProductIds = $update_product_ids;
+                } else {
+                    try {
+                        $existingProductStmt = $db->prepare("SELECT product_ids, product_id FROM service_orders WHERE id = :id");
+                        $existingProductStmt->bindValue(':id', $id, PDO::PARAM_INT);
+                        $existingProductStmt->execute();
+                        $existingProductRow = $existingProductStmt->fetch(PDO::FETCH_ASSOC);
+                        if ($existingProductRow) {
+                            $targetProductIds = normalizeIdList($existingProductRow['product_ids'] ?? ($existingProductRow['product_id'] ?? null));
+                        }
+                    } catch (Exception $e) {
+                        $targetProductIds = [];
+                    }
+                }
+                if (!empty($targetProductIds)) {
+                    $normalizedIssueMap = [];
+                    foreach ($targetProductIds as $productId) {
+                        $key = (string)$productId;
+                        $normalizedIssueMap[$key] = isset($issueMap[$key]) ? trim((string)$issueMap[$key]) : '';
+                    }
+                    $issueMap = $normalizedIssueMap;
+                } elseif (!empty($issueMap)) {
+                    $preservedIssueMap = [];
+                    foreach ($issueMap as $productId => $issueText) {
+                        $key = trim((string)$productId);
+                        if ($key === '') continue;
+                        $preservedIssueMap[$key] = trim((string)$issueText);
+                    }
+                    $issueMap = $preservedIssueMap;
+                }
+                $fields[] = 'issue_description_map = :issue_description_map';
+                $params[':issue_description_map'] = !empty($issueMap) ? json_encode($issueMap) : '{}';
+                if ($hasLegacyIssueDescriptionColumn) {
+                    $legacyIssue = 'N/A';
+                    foreach ($issueMap as $issueText) {
+                        $candidate = trim((string)$issueText);
+                        if ($candidate !== '') {
+                            $legacyIssue = $candidate;
+                            break;
+                        }
+                    }
+                    $fields[] = 'issue_description = :legacy_issue_description';
+                    $params[':legacy_issue_description'] = $legacyIssue;
+                }
+            }
             
             if ($hasHandoverTypeMapColumn && array_key_exists('handover_type_map', $input)) {
                 $handoverTypeMap = normalizeHandoverTypeMap($input['handover_type_map']);
@@ -2061,3 +2192,4 @@ try {
     echo json_encode(["success" => false, "message" => "Server error", "error" => $e->getMessage()]);
 }
 ?>
+

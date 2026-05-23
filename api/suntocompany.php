@@ -17,8 +17,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 class Database {
     private $host = "localhost";
     private $db_name = "raj communication";
-    private $username = "jeevan";
-    private $password = "123456";
+    private $username = "root";
+    private $password = "";
     public $conn;
 
     public function getConnection() {
@@ -26,7 +26,7 @@ class Database {
         $candidates = [
             $this->db_name,
             'raj_communication',
-            'raj communication'
+            'raj_communication'
         ];
 
         foreach ($candidates as $dbName) {

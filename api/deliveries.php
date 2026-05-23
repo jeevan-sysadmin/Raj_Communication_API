@@ -22,8 +22,8 @@ ini_set('log_errors', 1);
 class Database {
     private $host = "localhost";
     private $db_name = "raj communication";
-    private $username = "jeevan";
-    private $password = "123456";
+    private $username = "root";
+    private $password = "";
     public $conn;
 
     public function getConnection() {
@@ -238,6 +238,30 @@ function serviceOrdersHasProductStatusMapColumn($conn) {
     return $hasColumn;
 }
 
+function serviceOrdersHasColumn($conn, $columnName) {
+    static $cache = [];
+    $key = strtolower((string)$columnName);
+    if (array_key_exists($key, $cache)) {
+        return $cache[$key];
+    }
+    try {
+        $stmt = $conn->prepare("
+            SELECT 1
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'service_orders'
+              AND COLUMN_NAME = :column_name
+            LIMIT 1
+        ");
+        $stmt->bindValue(':column_name', $columnName, PDO::PARAM_STR);
+        $stmt->execute();
+        $cache[$key] = (bool)$stmt->fetchColumn();
+    } catch (Exception $e) {
+        $cache[$key] = false;
+    }
+    return $cache[$key];
+}
+
 function syncDeliveredProductStatusToDeliveries($conn) {
     $hasProductStatusMapColumn = serviceOrdersHasProductStatusMapColumn($conn);
     $productStatusMapSelect = $hasProductStatusMapColumn ? "so.product_status_map" : "NULL AS product_status_map";
@@ -324,24 +348,62 @@ function syncDeliveredProductStatusToDeliveries($conn) {
  */
 function getDeliveries($conn) {
     try {
+        $parseNameList = function ($value): array {
+            if (is_array($value)) {
+                return array_values(array_filter(array_map(function ($entry) {
+                    return trim((string)$entry);
+                }, $value), function ($entry) {
+                    return $entry !== '';
+                }));
+            }
+            if (!is_string($value)) return [];
+            $trimmed = trim($value);
+            if ($trimmed === '') return [];
+            $decoded = json_decode($trimmed, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                return array_values(array_filter(array_map(function ($entry) {
+                    return trim((string)$entry);
+                }, $decoded), function ($entry) {
+                    return $entry !== '';
+                }));
+            }
+            $parts = preg_split('/\|\||,/', $trimmed);
+            return array_values(array_filter(array_map(function ($entry) {
+                return trim((string)$entry);
+            }, $parts ?: []), function ($entry) {
+                return $entry !== '';
+            }));
+        };
+
         // Keep DB values aligned to enum-safe values before reads.
         normalizeDeliveryTypeRowsInDatabase($conn);
+        $hasProductNamesColumn = serviceOrdersHasColumn($conn, 'product_names');
+        $hasProductSerialNumbersColumn = serviceOrdersHasColumn($conn, 'product_serial_numbers');
+        $productNamesSelect = $hasProductNamesColumn ? "so.product_names" : "NULL AS product_names";
+        $productSerialsSelect = $hasProductSerialNumbersColumn ? "so.product_serial_numbers" : "NULL AS product_serial_numbers";
 
         if (isset($_GET['id']) && !empty($_GET['id'])) {
             $query = "SELECT d.*,
                              COALESCE(NULLIF(d.delivery_type, ''), 'inhand') AS delivery_type,
                              o.order_code, 
                              so.product_ids,
+                             {$productNamesSelect},
+                             {$productSerialsSelect},
                              so.product_status_map,
                              so.handover_type_map,
                              c.full_name as client_name, 
                              c.phone as client_phone,
                              c.email as client_email,
-                             c.address as client_address
+                             c.address as client_address,
+                             p.product_name,
+                             p.brand AS product_brand,
+                             p.model AS product_model,
+                             p.serial_number AS product_serial_number
                       FROM deliveries d 
                       LEFT JOIN service_orders o ON d.order_id = o.id 
                       LEFT JOIN service_orders so ON d.order_id = so.id
                       LEFT JOIN clients c ON o.client_id = c.id
+                      LEFT JOIN products p ON p.id = COALESCE(d.product_id, so.product_id)
                       WHERE d.id = :id";
 
             $stmt = $conn->prepare($query);
@@ -351,6 +413,34 @@ function getDeliveries($conn) {
 
             if ($delivery) {
                 $delivery['delivery_type'] = normalizeDeliveryType($delivery['delivery_type'] ?? '');
+                if (empty($delivery['product_serial_number']) && !empty($delivery['product_name'])) {
+                    $names = $parseNameList($delivery['product_names'] ?? null);
+                    $serials = $parseNameList($delivery['product_serial_numbers'] ?? null);
+                    $target = strtolower(trim((string)$delivery['product_name']));
+                    if (!empty($names) && !empty($serials)) {
+                        $found = false;
+                        foreach ($names as $index => $name) {
+                            if (strtolower(trim((string)$name)) === $target) {
+                                $delivery['product_serial_number'] = $serials[$index] ?? '';
+                                $found = true;
+                                break;
+                            }
+                        }
+                        if (!$found) {
+                            foreach ($names as $index => $name) {
+                                $normalizedName = strtolower(trim((string)$name));
+                                if ($normalizedName !== '' && (strpos($normalizedName, $target) !== false || strpos($target, $normalizedName) !== false)) {
+                                    $delivery['product_serial_number'] = $serials[$index] ?? '';
+                                    $found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!$found && !empty($serials[0])) {
+                            $delivery['product_serial_number'] = $serials[0];
+                        }
+                    }
+                }
                 echo json_encode([
                     'success' => true,
                     'delivery' => $delivery
@@ -401,16 +491,23 @@ function getDeliveries($conn) {
                          COALESCE(NULLIF(d.delivery_type, ''), 'inhand') AS delivery_type,
                          o.order_code, 
                          so.product_ids,
+                         {$productNamesSelect},
+                         {$productSerialsSelect},
                          so.product_status_map,
                          so.handover_type_map,
                          c.full_name as client_name, 
                          c.phone as client_phone,
                          c.email as client_email,
-                         c.address as client_address
+                         c.address as client_address,
+                         p.product_name,
+                         p.brand AS product_brand,
+                         p.model AS product_model,
+                         p.serial_number AS product_serial_number
                   FROM deliveries d 
                   LEFT JOIN service_orders o ON d.order_id = o.id 
                   LEFT JOIN service_orders so ON d.order_id = so.id
                   LEFT JOIN clients c ON o.client_id = c.id
+                  LEFT JOIN products p ON p.id = COALESCE(d.product_id, so.product_id)
                   {$whereClause}
                   ORDER BY d.scheduled_date DESC, d.scheduled_time DESC";
 
@@ -440,12 +537,14 @@ function getDeliveries($conn) {
             }
 
             if (!empty($delivery['order_id'])) {
-                $productQuery = "SELECT p.product_name, p.brand, p.model 
+                $productQuery = "SELECT p.product_name, p.brand, p.model, p.serial_number
                                  FROM service_orders so 
-                                 LEFT JOIN products p ON so.product_id = p.id 
+                                 LEFT JOIN products p ON COALESCE(:delivery_product_id, so.product_id) = p.id 
                                  WHERE so.id = :order_id";
                 $productStmt = $conn->prepare($productQuery);
                 $productStmt->bindValue(':order_id', (int)$delivery['order_id'], PDO::PARAM_INT);
+                $deliveryProductId = isset($delivery['product_id']) ? (int)$delivery['product_id'] : 0;
+                $productStmt->bindValue(':delivery_product_id', $deliveryProductId > 0 ? $deliveryProductId : null, $deliveryProductId > 0 ? PDO::PARAM_INT : PDO::PARAM_NULL);
                 $productStmt->execute();
                 $product = $productStmt->fetch(PDO::FETCH_ASSOC);
 
@@ -453,6 +552,36 @@ function getDeliveries($conn) {
                     $delivery['product_name'] = $product['product_name'];
                     $delivery['product_brand'] = $product['brand'];
                     $delivery['product_model'] = $product['model'];
+                    $delivery['product_serial_number'] = $product['serial_number'];
+                }
+            }
+
+            if (empty($delivery['product_serial_number']) && !empty($delivery['product_name'])) {
+                $names = $parseNameList($delivery['product_names'] ?? null);
+                $serials = $parseNameList($delivery['product_serial_numbers'] ?? null);
+                $target = strtolower(trim((string)$delivery['product_name']));
+                if (!empty($names) && !empty($serials)) {
+                    $found = false;
+                    foreach ($names as $index => $name) {
+                        if (strtolower(trim((string)$name)) === $target) {
+                            $delivery['product_serial_number'] = $serials[$index] ?? '';
+                            $found = true;
+                            break;
+                        }
+                    }
+                    if (!$found) {
+                        foreach ($names as $index => $name) {
+                            $normalizedName = strtolower(trim((string)$name));
+                            if ($normalizedName !== '' && (strpos($normalizedName, $target) !== false || strpos($target, $normalizedName) !== false)) {
+                                $delivery['product_serial_number'] = $serials[$index] ?? '';
+                                $found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!$found && !empty($serials[0])) {
+                        $delivery['product_serial_number'] = $serials[0];
+                    }
                 }
             }
         }

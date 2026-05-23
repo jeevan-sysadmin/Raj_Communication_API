@@ -80,15 +80,8 @@ function normalizeProductPayloadAliases($row) {
         return $row;
     }
 
-    if (isset($row['product']) && is_array($row['product'])) {
-        $row = array_merge($row['product'], $row);
-    }
-    if (isset($row['data']) && is_array($row['data'])) {
-        $row = array_merge($row['data'], $row);
-    }
-
     if (!isset($row['product_name']) || trim((string)$row['product_name']) === '') {
-        $aliasKeys = ['productName', 'name', 'product_title'];
+        $aliasKeys = ['productName', 'name'];
         foreach ($aliasKeys as $aliasKey) {
             if (isset($row[$aliasKey]) && trim((string)$row[$aliasKey]) !== '') {
                 $row['product_name'] = trim((string)$row[$aliasKey]);
@@ -104,26 +97,61 @@ function normalizeProductPayloadAliases($row) {
 class Database {
     private $host = "localhost";
     private $db_name = "raj communication";
-    private $username = "jeevan";
-    private $password = "123456";
+    private $username = "root";
+    private $password = "";
     public $conn;
+
+    private function ensureProductsStockColumns(PDO $conn) {
+        $checkQuery = "SELECT COLUMN_NAME
+                       FROM information_schema.COLUMNS
+                       WHERE TABLE_SCHEMA = DATABASE()
+                         AND TABLE_NAME = 'products'
+                         AND COLUMN_NAME = 'stock_quantity'";
+        $stmt = $conn->query($checkQuery);
+        $existing = [];
+        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+            if (!empty($row['COLUMN_NAME'])) {
+                $existing[$row['COLUMN_NAME']] = true;
+            }
+        }
+
+        if (!isset($existing['stock_quantity'])) {
+            $conn->exec("ALTER TABLE products ADD COLUMN stock_quantity INT(10) UNSIGNED NOT NULL DEFAULT 1 AFTER price");
+        }
+    }
 
     public function getConnection() {
         $this->conn = null;
-        try {
-            $this->conn = new PDO(
-                "mysql:host=" . $this->host . ";dbname=" . $this->db_name . ";charset=utf8mb4",
-                $this->username,
-                $this->password
-            );
-            $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-            $this->conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-        } catch(PDOException $e) {
-            http_response_code(500);
-            echo json_encode(["success" => false, "message" => "Database connection failed: " . $e->getMessage()]);
-            exit();
+        $candidates = [
+            $this->db_name,
+            'raj_communication',
+            'raj_communication'
+        ];
+
+        foreach ($candidates as $dbName) {
+            try {
+                $conn = new PDO(
+                    "mysql:host=" . $this->host . ";dbname=" . $dbName . ";charset=utf8mb4",
+                    $this->username,
+                    $this->password
+                );
+                $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+                $conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+
+                $probe = $conn->query("SHOW TABLES LIKE 'products'");
+                if ($probe && $probe->fetch()) {
+                    $this->ensureProductsStockColumns($conn);
+                    $this->conn = $conn;
+                    return $this->conn;
+                }
+            } catch (PDOException $e) {
+                continue;
+            }
         }
-        return $this->conn;
+
+        http_response_code(500);
+        echo json_encode(["success" => false, "message" => "Database connection failed"]);
+        exit();
     }
 }
 
@@ -131,15 +159,17 @@ class Database {
 class Product {
     private $conn;
     private $table = 'products';
+    private $columnExistsCache = [];
     
     // Valid claim types
     private $valid_claim_types = ['none', 'shop_claim', 'company_claim', 'sun_to_company', 'company_to_sun'];
     private $valid_categories = ['cctv', 'harddisk', 'DVR', 'wificamer', 'others'];
-    private $valid_statuses = ['active', 'handover'];
+    private $valid_statuses = ['active', 'inactive', 'discontinued', 'out_of_stock'];
 
     public $id;
     public $product_code;
     public $serial_number;
+    public $stock_quantity;
     public $is_spare_product;
     public $product_name;
     public $brand;
@@ -172,6 +202,35 @@ class Product {
 
         $code = $exception->errorInfo[1] ?? null;
         return (int)$code === 1062;
+    }
+
+    private function normalizeStockQuantity($stock_quantity) {
+        if ($stock_quantity === null || $stock_quantity === '') {
+            return 1;
+        }
+
+        $value = intval($stock_quantity);
+        return $value < 0 ? 0 : $value;
+    }
+
+    private function hasColumn($columnName) {
+        if (array_key_exists($columnName, $this->columnExistsCache)) {
+            return $this->columnExistsCache[$columnName];
+        }
+
+        $query = "SELECT COUNT(*) AS cnt
+                  FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = :table_name
+                    AND COLUMN_NAME = :column_name";
+        $stmt = $this->conn->prepare($query);
+        $stmt->bindParam(':table_name', $this->table);
+        $stmt->bindParam(':column_name', $columnName);
+        $stmt->execute();
+        $count = (int)($stmt->fetch()['cnt'] ?? 0);
+        $exists = $count > 0;
+        $this->columnExistsCache[$columnName] = $exists;
+        return $exists;
     }
 
     private function productCodeExists($product_code) {
@@ -326,42 +385,50 @@ class Product {
         $this->purchase_date = !empty($this->purchase_date) ? $this->purchase_date : null;
         $this->warranty_period = !empty($this->warranty_period) ? trim($this->warranty_period) : null;
         $this->price = !empty($this->price) ? floatval($this->price) : 0;
+        $this->stock_quantity = $this->normalizeStockQuantity($this->stock_quantity);
         $this->status = $this->validateStatus($this->status);
         $this->is_spare_product = !empty($this->is_spare_product) ? 1 : 0;
         
-        $query = "INSERT INTO " . $this->table . " 
-                 SET product_code = :product_code,
-                     serial_number = :serial_number,
-                     is_spare_product = :is_spare_product,
-                     product_name = :product_name,
-                     brand = :brand,
-                     model = :model,
-                     category = :category,
-                     claim_type = :claim_type,
-                     specifications = :specifications,
-                     purchase_date = :purchase_date,
-                     warranty_period = :warranty_period,
-                     price = :price,
-                     status = :status,
-                     created_at = NOW()";
-        
-        $stmt = $this->conn->prepare($query);
-        
-        $stmt->bindParam(':product_code', $this->product_code);
-        $stmt->bindParam(':serial_number', $this->serial_number);
-        $stmt->bindParam(':is_spare_product', $this->is_spare_product);
-        $stmt->bindParam(':product_name', $this->product_name);
-        $stmt->bindParam(':brand', $this->brand);
-        $stmt->bindParam(':model', $this->model);
-        $stmt->bindParam(':category', $this->category);
-        $stmt->bindParam(':claim_type', $this->claim_type);
-        $stmt->bindParam(':specifications', $this->specifications);
-        $stmt->bindParam(':purchase_date', $this->purchase_date);
-        $stmt->bindParam(':warranty_period', $this->warranty_period);
-        $stmt->bindParam(':price', $this->price);
-        $stmt->bindParam(':status', $this->status);
-        
+        $hasStockQuantity = $this->hasColumn('stock_quantity');
         for ($attempt = 0; $attempt < 5; $attempt++) {
+            $fields = [
+                "product_code = :product_code",
+                "serial_number = :serial_number",
+                "is_spare_product = :is_spare_product",
+                "product_name = :product_name",
+                "brand = :brand",
+                "model = :model",
+                "category = :category",
+                "claim_type = :claim_type",
+                "specifications = :specifications",
+                "purchase_date = :purchase_date",
+                "warranty_period = :warranty_period",
+                "price = :price",
+                "status = :status",
+                "created_at = NOW()"
+            ];
+            if ($hasStockQuantity) {
+                $fields[] = "stock_quantity = :stock_quantity";
+            }
+            $query = "INSERT INTO " . $this->table . " SET " . implode(", ", $fields);
+            $stmt = $this->conn->prepare($query);
+
+            $stmt->bindParam(':product_code', $this->product_code);
+            $stmt->bindParam(':serial_number', $this->serial_number);
+            $stmt->bindParam(':is_spare_product', $this->is_spare_product);
+            $stmt->bindParam(':product_name', $this->product_name);
+            $stmt->bindParam(':brand', $this->brand);
+            $stmt->bindParam(':model', $this->model);
+            $stmt->bindParam(':category', $this->category);
+            $stmt->bindParam(':claim_type', $this->claim_type);
+            $stmt->bindParam(':specifications', $this->specifications);
+            $stmt->bindParam(':purchase_date', $this->purchase_date);
+            $stmt->bindParam(':warranty_period', $this->warranty_period);
+            $stmt->bindParam(':price', $this->price);
+            if ($hasStockQuantity) {
+                $stmt->bindParam(':stock_quantity', $this->stock_quantity);
+            }
+            $stmt->bindParam(':status', $this->status);
             try {
                 if ($stmt->execute()) {
                     return [
@@ -384,6 +451,12 @@ class Product {
                         $stmt->bindParam(':product_code', $this->product_code);
                         continue;
                     }
+                }
+                $errorText = strtolower($e->getMessage());
+                if ($hasStockQuantity && strpos($errorText, "unknown column 'stock_quantity'") !== false) {
+                    $hasStockQuantity = false;
+                    $this->columnExistsCache['stock_quantity'] = false;
+                    continue;
                 }
                 throw $e;
             }
@@ -412,43 +485,63 @@ class Product {
         $this->purchase_date = !empty($this->purchase_date) ? $this->purchase_date : null;
         $this->warranty_period = !empty($this->warranty_period) ? trim($this->warranty_period) : null;
         $this->price = !empty($this->price) ? floatval($this->price) : 0;
+        $this->stock_quantity = $this->normalizeStockQuantity($this->stock_quantity);
         $this->status = $this->validateStatus($this->status);
         $this->is_spare_product = !empty($this->is_spare_product) ? 1 : 0;
         
-        $query = "UPDATE " . $this->table . " 
-                 SET serial_number = :serial_number,
-                     is_spare_product = :is_spare_product,
-                     product_name = :product_name,
-                     brand = :brand,
-                     model = :model,
-                     category = :category,
-                     claim_type = :claim_type,
-                     specifications = :specifications,
-                     purchase_date = :purchase_date,
-                     warranty_period = :warranty_period,
-                     price = :price,
-                     status = :status,
-                     updated_at = NOW()
-                 WHERE id = :id";
-        
-        $stmt = $this->conn->prepare($query);
-        
-        $stmt->bindParam(':id', $this->id);
-        $stmt->bindParam(':serial_number', $this->serial_number);
-        $stmt->bindParam(':is_spare_product', $this->is_spare_product);
-        $stmt->bindParam(':product_name', $this->product_name);
-        $stmt->bindParam(':brand', $this->brand);
-        $stmt->bindParam(':model', $this->model);
-        $stmt->bindParam(':category', $this->category);
-        $stmt->bindParam(':claim_type', $this->claim_type);
-        $stmt->bindParam(':specifications', $this->specifications);
-        $stmt->bindParam(':purchase_date', $this->purchase_date);
-        $stmt->bindParam(':warranty_period', $this->warranty_period);
-        $stmt->bindParam(':price', $this->price);
-        $stmt->bindParam(':status', $this->status);
-        
-        if($stmt->execute()) {
-            return ['success' => true, 'message' => 'Product updated successfully'];
+        $hasStockQuantity = $this->hasColumn('stock_quantity');
+        for ($attempt = 0; $attempt < 2; $attempt++) {
+            $fields = [
+                "serial_number = :serial_number",
+                "is_spare_product = :is_spare_product",
+                "product_name = :product_name",
+                "brand = :brand",
+                "model = :model",
+                "category = :category",
+                "claim_type = :claim_type",
+                "specifications = :specifications",
+                "purchase_date = :purchase_date",
+                "warranty_period = :warranty_period",
+                "price = :price",
+                "status = :status",
+                "updated_at = NOW()"
+            ];
+            if ($hasStockQuantity) {
+                $fields[] = "stock_quantity = :stock_quantity";
+            }
+            $query = "UPDATE " . $this->table . " SET " . implode(", ", $fields) . " WHERE id = :id";
+            $stmt = $this->conn->prepare($query);
+
+            $stmt->bindParam(':id', $this->id);
+            $stmt->bindParam(':serial_number', $this->serial_number);
+            $stmt->bindParam(':is_spare_product', $this->is_spare_product);
+            $stmt->bindParam(':product_name', $this->product_name);
+            $stmt->bindParam(':brand', $this->brand);
+            $stmt->bindParam(':model', $this->model);
+            $stmt->bindParam(':category', $this->category);
+            $stmt->bindParam(':claim_type', $this->claim_type);
+            $stmt->bindParam(':specifications', $this->specifications);
+            $stmt->bindParam(':purchase_date', $this->purchase_date);
+            $stmt->bindParam(':warranty_period', $this->warranty_period);
+            $stmt->bindParam(':price', $this->price);
+            if ($hasStockQuantity) {
+                $stmt->bindParam(':stock_quantity', $this->stock_quantity);
+            }
+            $stmt->bindParam(':status', $this->status);
+            try {
+                if($stmt->execute()) {
+                    return ['success' => true, 'message' => 'Product updated successfully'];
+                }
+                return ['success' => false, 'message' => 'Failed to update product'];
+            } catch (PDOException $e) {
+                $errorText = strtolower($e->getMessage());
+                if ($hasStockQuantity && strpos($errorText, "unknown column 'stock_quantity'") !== false) {
+                    $hasStockQuantity = false;
+                    $this->columnExistsCache['stock_quantity'] = false;
+                    continue;
+                }
+                throw $e;
+            }
         }
         return ['success' => false, 'message' => 'Failed to update product'];
     }
@@ -462,12 +555,12 @@ class Product {
         $result = $checkStmt->fetch();
         
         if ($result && $result['order_count'] > 0) {
-            // Product has orders, mark as handover instead of deleting
-            $query = "UPDATE " . $this->table . " SET status = 'handover', updated_at = NOW() WHERE id = :id";
+            // Product has orders, mark as discontinued instead of deleting
+            $query = "UPDATE " . $this->table . " SET status = 'discontinued', updated_at = NOW() WHERE id = :id";
             $stmt = $this->conn->prepare($query);
             $stmt->bindParam(':id', $this->id);
             if($stmt->execute()) {
-                return ['success' => true, 'message' => 'Product has associated orders. Status changed to handover'];
+                return ['success' => true, 'message' => 'Product has associated orders. Status changed to discontinued'];
             }
             return ['success' => false, 'message' => 'Failed to update product status'];
         } else {
@@ -608,6 +701,7 @@ try {
                     $product->purchase_date = isset($row['purchase_date']) ? $row['purchase_date'] : null;
                     $product->warranty_period = isset($row['warranty_period']) ? $row['warranty_period'] : '';
                     $product->price = isset($row['price']) ? $row['price'] : 0;
+                    $product->stock_quantity = isset($row['stock_quantity']) ? $row['stock_quantity'] : 1;
                     $product->status = isset($row['status']) ? $row['status'] : 'active';
 
                     $result = $product->create();
@@ -676,6 +770,7 @@ try {
             $product->purchase_date = isset($input['purchase_date']) ? $input['purchase_date'] : null;
             $product->warranty_period = isset($input['warranty_period']) ? $input['warranty_period'] : '';
             $product->price = isset($input['price']) ? $input['price'] : 0;
+            $product->stock_quantity = isset($input['stock_quantity']) ? $input['stock_quantity'] : 1;
             $product->status = isset($input['status']) ? $input['status'] : 'active';
 
             $result = $product->create();
@@ -695,23 +790,42 @@ try {
             break;
             
         case 'PUT':
-            $id = isset($_GET['id']) ? $_GET['id'] : null;
-            
-            if(!$id) {
-                $input = json_decode(file_get_contents("php://input"), true);
-                $id = isset($input['id']) ? $input['id'] : null;
+            $rawInput = file_get_contents("php://input");
+            $input = json_decode($rawInput, true);
+            if(!$input || !is_array($input)) {
+                $input = $_POST;
             }
-            
-            if(!$id) {
+
+            $id = isset($_GET['id']) ? $_GET['id'] : null;
+            if(!$id && isset($_REQUEST['id'])) {
+                $id = $_REQUEST['id'];
+            }
+            if(!$id && isset($input['id'])) {
+                $id = $input['id'];
+            }
+            if(!$id && isset($input['product_id'])) {
+                $id = $input['product_id'];
+            }
+            if(!$id && !empty($_SERVER['QUERY_STRING'])) {
+                parse_str($_SERVER['QUERY_STRING'], $queryParams);
+                if (isset($queryParams['id'])) {
+                    $id = $queryParams['id'];
+                }
+            }
+            if(!$id && !empty($_SERVER['REQUEST_URI'])) {
+                $uriParts = parse_url($_SERVER['REQUEST_URI']);
+                if (isset($uriParts['query'])) {
+                    parse_str($uriParts['query'], $uriQueryParams);
+                    if (isset($uriQueryParams['id'])) {
+                        $id = $uriQueryParams['id'];
+                    }
+                }
+            }
+
+            if(!$id || intval($id) <= 0) {
                 http_response_code(400);
                 echo json_encode(["success" => false, "message" => "Product ID is required"]);
                 break;
-            }
-            
-            $input = json_decode(file_get_contents("php://input"), true);
-            
-            if(!$input) {
-                $input = $_POST;
             }
 
             $input = normalizeProductPayloadAliases($input);
@@ -750,6 +864,7 @@ try {
             $product->purchase_date = isset($input['purchase_date']) ? $input['purchase_date'] : ($existingProduct['purchase_date'] ?? null);
             $product->warranty_period = isset($input['warranty_period']) ? $input['warranty_period'] : ($existingProduct['warranty_period'] ?? '');
             $product->price = isset($input['price']) ? $input['price'] : ($existingProduct['price'] ?? 0);
+            $product->stock_quantity = isset($input['stock_quantity']) ? $input['stock_quantity'] : ($existingProduct['stock_quantity'] ?? 1);
             $product->status = isset($input['status']) ? $input['status'] : ($existingProduct['status'] ?? 'active');
             
             $result = $product->update();
@@ -802,8 +917,4 @@ try {
     ]);
 }
 ?>
-
-
-
-
 

@@ -597,10 +597,10 @@ class AdminAPI {
             $stmt = $this->conn->query($query);
             $stats['delivered_orders'] = (int)$stmt->fetchColumn();
             
-            // Total revenue from payments table (completed payments only)
-            $query = "SELECT COALESCE(SUM(amount), 0) as total_revenue 
-                     FROM payments 
-                     WHERE payment_status IN ('completed', 'paid')";
+            // Total service margin from service orders (final_cost - deposit_amount)
+            $query = "SELECT COALESCE(SUM(COALESCE(final_cost, 0) - COALESCE(deposit_amount, 0)), 0) as total_revenue
+                     FROM service_orders
+                     WHERE payment_status <> 'refunded'";
             $stmt = $this->conn->query($query);
             $stats['total_revenue'] = (float)$stmt->fetchColumn();
             
@@ -609,11 +609,11 @@ class AdminAPI {
             $stmt = $this->conn->query($query);
             $stats['today_orders'] = (int)$stmt->fetchColumn();
             
-            // Today's revenue from payments table (completed payments only)
-            $query = "SELECT COALESCE(SUM(amount), 0) as today_revenue 
-                     FROM payments 
-                     WHERE DATE(created_at) = CURDATE() 
-                     AND payment_status IN ('completed', 'paid')";
+            // Today's service margin from service orders (final_cost - deposit_amount)
+            $query = "SELECT COALESCE(SUM(COALESCE(final_cost, 0) - COALESCE(deposit_amount, 0)), 0) as today_revenue
+                     FROM service_orders
+                     WHERE DATE(created_at) = CURDATE()
+                     AND payment_status <> 'refunded'";
             $stmt = $this->conn->query($query);
             $stats['today_revenue'] = (float)$stmt->fetchColumn();
             
@@ -2344,7 +2344,7 @@ class AdminAPI {
                      SUM(CASE WHEN o.status IN ('pending', 'scheduled', 'process', 'ready') THEN 1 ELSE 0 END) as active_orders,
                      COALESCE(SUM(CASE
                         WHEN o.status IN ('completed', 'delivered') AND o.payment_status <> 'refunded'
-                        THEN COALESCE(o.final_cost, 0)
+                        THEN (COALESCE(o.final_cost, 0) - COALESCE(o.deposit_amount, 0))
                         ELSE 0
                      END), 0) as total_revenue,
                      COALESCE(AVG(CASE
@@ -2406,13 +2406,13 @@ class AdminAPI {
         try {
             $analytics = [];
             
-            // Monthly revenue from payments table (last 6 months)
-            $query = "SELECT DATE_FORMAT(p.created_at, '%Y-%m') as month, 
-                     COALESCE(SUM(p.amount), 0) as revenue
-                     FROM payments p
-                     WHERE p.payment_status IN ('completed', 'paid') 
-                     AND p.created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
-                     GROUP BY DATE_FORMAT(p.created_at, '%Y-%m')
+            // Monthly service margin from service orders (final_cost - deposit_amount)
+            $query = "SELECT DATE_FORMAT(o.created_at, '%Y-%m') as month,
+                     COALESCE(SUM(COALESCE(o.final_cost, 0) - COALESCE(o.deposit_amount, 0)), 0) as revenue
+                     FROM service_orders o
+                     WHERE o.payment_status <> 'refunded'
+                     AND o.created_at >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+                     GROUP BY DATE_FORMAT(o.created_at, '%Y-%m')
                      ORDER BY month";
             
             $stmt = $this->conn->query($query);
@@ -2429,7 +2429,7 @@ class AdminAPI {
             $analytics['order_trends'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
             
             // Category distribution from orders
-            $query = "SELECT p.category, COUNT(*) as count, COALESCE(SUM(o.final_cost), 0) as value
+            $query = "SELECT p.category, COUNT(*) as count, COALESCE(SUM(COALESCE(o.final_cost, 0) - COALESCE(o.deposit_amount, 0)), 0) as value
                      FROM service_orders o
                      JOIN products p ON o.product_id = p.id
                      WHERE o.status NOT IN ('cancelled')
@@ -2489,12 +2489,12 @@ class AdminAPI {
             
             $analytics['priority_distribution'] = $priorityData;
             
-            // Daily revenue trend (last 7 days) from payments
-            $query = "SELECT DATE(p.created_at) as date, COALESCE(SUM(p.amount), 0) as revenue
-                     FROM payments p
-                     WHERE p.payment_status IN ('completed', 'paid')
-                     AND p.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-                     GROUP BY DATE(p.created_at)
+            // Daily service margin trend (last 7 days) from service orders
+            $query = "SELECT DATE(o.created_at) as date, COALESCE(SUM(COALESCE(o.final_cost, 0) - COALESCE(o.deposit_amount, 0)), 0) as revenue
+                     FROM service_orders o
+                     WHERE o.payment_status <> 'refunded'
+                     AND o.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                     GROUP BY DATE(o.created_at)
                      ORDER BY date";
             
             $stmt = $this->conn->query($query);

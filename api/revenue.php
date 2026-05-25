@@ -113,6 +113,7 @@ $filters = [
 
 $orderConditions = [
     "DATE(so.created_at) BETWEEN :from_date AND :to_date",
+    "LOWER(TRIM(COALESCE(so.payment_status, ''))) = 'paid'",
 ];
 $orderParams = [
     ':from_date' => $period['from_date'],

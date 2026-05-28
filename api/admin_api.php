@@ -541,6 +541,10 @@ class AdminAPI {
             case 'reset_password':
                 $this->resetPassword();
                 break;
+
+            case 'backup_database':
+                $this->backupDatabase();
+                break;
                 
             default:
                 $this->sendError("Invalid action", 400);
@@ -2640,6 +2644,84 @@ class AdminAPI {
             
         } catch (Exception $e) {
             $this->sendError("Failed to reset password: " . $e->getMessage(), 500);
+        }
+    }
+
+    private function backupDatabase() {
+        try {
+            $dbName = (string)$this->conn->query('SELECT DATABASE()')->fetchColumn();
+            if ($dbName === '') {
+                $this->sendError('Unable to determine active database', 500);
+                return;
+            }
+
+            $tablesStmt = $this->conn->query('SHOW TABLES');
+            $tables = $tablesStmt->fetchAll(PDO::FETCH_COLUMN) ?: [];
+
+            $dump = "-- Raj Communication Database Backup\n";
+            $dump .= "-- Generated At: " . date('Y-m-d H:i:s') . "\n";
+            $dump .= "-- Database: " . $dbName . "\n\n";
+            $dump .= "SET FOREIGN_KEY_CHECKS=0;\n\n";
+
+            foreach ($tables as $table) {
+                $tableName = (string)$table;
+                if ($tableName === '') {
+                    continue;
+                }
+
+                $escapedTable = '`' . str_replace('`', '``', $tableName) . '`';
+
+                $createStmt = $this->conn->query("SHOW CREATE TABLE {$escapedTable}");
+                $createRow = $createStmt ? $createStmt->fetch(PDO::FETCH_ASSOC) : null;
+                $createSql = $createRow['Create Table'] ?? null;
+
+                if (!$createSql) {
+                    continue;
+                }
+
+                $dump .= "--\n-- Table structure for table {$escapedTable}\n--\n";
+                $dump .= "DROP TABLE IF EXISTS {$escapedTable};\n";
+                $dump .= $createSql . ";\n\n";
+
+                $rowsStmt = $this->conn->query("SELECT * FROM {$escapedTable}");
+                $rows = $rowsStmt ? $rowsStmt->fetchAll(PDO::FETCH_ASSOC) : [];
+
+                if (!empty($rows)) {
+                    $columns = array_keys($rows[0]);
+                    $columnSql = implode(', ', array_map(function ($column) {
+                        return '`' . str_replace('`', '``', (string)$column) . '`';
+                    }, $columns));
+
+                    $dump .= "--\n-- Dumping data for table {$escapedTable}\n--\n";
+                    foreach ($rows as $row) {
+                        $values = [];
+                        foreach ($columns as $column) {
+                            $value = $row[$column] ?? null;
+                            if ($value === null) {
+                                $values[] = 'NULL';
+                            } else {
+                                $values[] = $this->conn->quote((string)$value);
+                            }
+                        }
+                        $dump .= "INSERT INTO {$escapedTable} ({$columnSql}) VALUES (" . implode(', ', $values) . ");\n";
+                    }
+                    $dump .= "\n";
+                }
+            }
+
+            $dump .= "SET FOREIGN_KEY_CHECKS=1;\n";
+
+            $fileName = 'raj_communication.sql';
+            header_remove('Content-Type');
+            header('Content-Type: application/sql');
+            header('Content-Disposition: attachment; filename="' . $fileName . '"');
+            header('Cache-Control: no-store, no-cache, must-revalidate');
+            header('Pragma: no-cache');
+            header('Expires: 0');
+            echo $dump;
+            exit();
+        } catch (Exception $e) {
+            $this->sendError('Failed to generate backup: ' . $e->getMessage(), 500);
         }
     }
     

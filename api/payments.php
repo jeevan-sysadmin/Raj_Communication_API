@@ -1,14 +1,7 @@
 <?php
-header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With");
-header("Content-Type: application/json; charset=UTF-8");
-
-// Handle preflight requests
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
-    exit();
-}
+require_once __DIR__ . '/helpers/performance.php';
+initApiResponse();
+setApiErrorMode(false);
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/helpers/jwt_helper.php';
@@ -101,6 +94,8 @@ try {
             $order_id = isset($_GET['order_id']) ? $_GET['order_id'] : null;
             $page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
             $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 25;
+            $page = max(1, $page);
+            $limit = max(1, min($limit, 100));
             $offset = ($page - 1) * $limit;
             
             if ($order_id) {

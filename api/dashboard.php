@@ -1,20 +1,7 @@
 <?php
-// Enable CORS
-header("Access-Control-Allow-Origin: *");
-header("Content-Type: application/json; charset=UTF-8");
-header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With");
-header("Access-Control-Max-Age: 3600");
-
-// Handle preflight OPTIONS request
-if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
-    http_response_code(200);
-    exit();
-}
-
-// Error reporting for development
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
+require_once __DIR__ . '/helpers/performance.php';
+initApiResponse();
+setApiErrorMode(false);
 
 // Include required files - FIXED PATH
 require_once __DIR__ . '/config/database.php';
@@ -481,15 +468,15 @@ function getDashboardOverview($conn) {
         $pendingOrders = $pendingStmt->fetch(PDO::FETCH_ASSOC)['total'];
         
         // Get completed orders (this month)
-        $monthStart = date('Y-m-01');
-        $completedQuery = "SELECT COUNT(*) as total FROM service_orders WHERE status = 'delivered' AND DATE(updated_at) >= :month_start";
+        $monthStart = date('Y-m-01 00:00:00');
+        $completedQuery = "SELECT COUNT(*) as total FROM service_orders WHERE status = 'delivered' AND updated_at >= :month_start";
         $completedStmt = $conn->prepare($completedQuery);
         $completedStmt->bindParam(':month_start', $monthStart);
         $completedStmt->execute();
         $completedOrders = $completedStmt->fetch(PDO::FETCH_ASSOC)['total'];
         
         // Get total revenue (this month)
-        $revenueQuery = "SELECT SUM(final_cost) as total FROM service_orders WHERE status = 'delivered' AND DATE(updated_at) >= :month_start AND final_cost IS NOT NULL";
+        $revenueQuery = "SELECT SUM(final_cost) as total FROM service_orders WHERE status = 'delivered' AND updated_at >= :month_start AND final_cost IS NOT NULL";
         $revenueStmt = $conn->prepare($revenueQuery);
         $revenueStmt->bindParam(':month_start', $monthStart);
         $revenueStmt->execute();

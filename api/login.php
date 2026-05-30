@@ -1,27 +1,16 @@
 <?php
-// Enable CORS for development
-header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With");
-header("Content-Type: application/json; charset=UTF-8");
-
-// Handle preflight requests
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
-    exit();
-}
+require_once __DIR__ . '/helpers/performance.php';
+initApiResponse(['POST', 'GET', 'OPTIONS']);
+setApiErrorMode(false);
 
 // Include required files
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/helpers/jwt_helper.php';
 
-// Set error reporting for development
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
-
 class LoginAPI {
     private $conn;
     private $data;
+    private $usersTableBootstrapped = false;
 
     public function __construct() {
         $database = new Database();
@@ -56,15 +45,6 @@ class LoginAPI {
             if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
                 $this->sendError("Invalid email format", 400);
                 return;
-            }
-
-            // Check if users table exists
-            $checkTable = "SHOW TABLES LIKE 'users'";
-            $stmt = $this->conn->query($checkTable);
-            
-            if ($stmt->rowCount() == 0) {
-                // Create default users if table doesn't exist
-                $this->createDefaultUsers();
             }
 
             // Prepare SQL query
@@ -127,9 +107,18 @@ class LoginAPI {
                 $this->sendError("Database query failed", 500);
             }
             
+        } catch (PDOException $e) {
+            if (!$this->usersTableBootstrapped && ((int)$e->getCode() === 42 || strpos($e->getMessage(), "doesn't exist") !== false)) {
+                $this->usersTableBootstrapped = true;
+                $this->createDefaultUsers();
+                $this->login();
+                return;
+            }
+            error_log("Login PDO error: " . $e->getMessage());
+            $this->sendError("Server error occurred", 500);
         } catch (Exception $e) {
             error_log("Login error: " . $e->getMessage());
-            $this->sendError("Server error occurred: " . $e->getMessage(), 500);
+            $this->sendError("Server error occurred", 500);
         }
     }
 

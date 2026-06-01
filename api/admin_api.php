@@ -286,6 +286,16 @@ class AdminAPI {
             }
         }
 
+        if ((!isset($row['stock_quantity']) || $row['stock_quantity'] === '' || $row['stock_quantity'] === null)) {
+            $stockAliasKeys = ['stockQuantity', 'quantity', 'qty'];
+            foreach ($stockAliasKeys as $aliasKey) {
+                if (array_key_exists($aliasKey, $row) && $row[$aliasKey] !== '' && $row[$aliasKey] !== null) {
+                    $row['stock_quantity'] = $row[$aliasKey];
+                    break;
+                }
+            }
+        }
+
         return $row;
     }
 
@@ -1101,11 +1111,12 @@ class AdminAPI {
                     } else {
                         // Create placeholder product
                         $product_code = 'PRD' . date('Ymd') . strtoupper(substr(uniqid(), -6));
-                        $productInsert = "INSERT INTO products (product_code, product_name, category, price, status, created_at) 
-                                        VALUES (:product_code, :product_name, 'other', 0, 'active', NOW())";
+                        $productInsert = "INSERT INTO products (product_code, product_name, category, price, stock_quantity, status, created_at) 
+                                        VALUES (:product_code, :product_name, 'other', 0, :stock_quantity, 'active', NOW())";
                         $productInsertStmt = $this->conn->prepare($productInsert);
                         $productInsertStmt->bindValue(':product_code', $product_code, PDO::PARAM_STR);
                         $productInsertStmt->bindValue(':product_name', $product_name, PDO::PARAM_STR);
+                        $productInsertStmt->bindValue(':stock_quantity', 1, PDO::PARAM_INT);
                         
                         if ($productInsertStmt->execute()) {
                             $product_id = $this->conn->lastInsertId();
@@ -1894,13 +1905,19 @@ class AdminAPI {
 
                 $productCode = 'PRD' . date('Ymd') . strtoupper(substr(uniqid(), -6));
 
+                $resolvedStockQuantity = isset($row['stock_quantity']) ? max(1, intval($row['stock_quantity'])) : 1;
+                // If a concrete serial is provided, treat it as one physical unit.
+                if ($serialNumber !== '') {
+                    $resolvedStockQuantity = 1;
+                }
+
                 $query = "INSERT INTO products (
                             product_code, serial_number, is_spare_product, product_name, brand, model, category,
-                            claim_type, specifications, purchase_date, warranty_period, price, status, created_at
+                            claim_type, specifications, purchase_date, warranty_period, price, stock_quantity, status, created_at
                           )
                           VALUES (
                             :product_code, :serial_number, :is_spare_product, :product_name, :brand, :model, :category,
-                            :claim_type, :specifications, :purchase_date, :warranty_period, :price, :status, NOW()
+                            :claim_type, :specifications, :purchase_date, :warranty_period, :price, :stock_quantity, :status, NOW()
                           )";
 
                 $stmt = $this->conn->prepare($query);
@@ -1916,6 +1933,7 @@ class AdminAPI {
                 $stmt->bindValue(':purchase_date', isset($row['purchase_date']) && trim((string)$row['purchase_date']) !== '' ? $row['purchase_date'] : date('Y-m-d'), PDO::PARAM_STR);
                 $stmt->bindValue(':warranty_period', isset($row['warranty_period']) && trim((string)$row['warranty_period']) !== '' ? trim((string)$row['warranty_period']) : '1 year', PDO::PARAM_STR);
                 $stmt->bindValue(':price', isset($row['price']) ? (float)$row['price'] : 0);
+                $stmt->bindValue(':stock_quantity', $resolvedStockQuantity, PDO::PARAM_INT);
                 $stmt->bindValue(':status', $status, PDO::PARAM_STR);
 
                 if (!$stmt->execute()) {

@@ -69,6 +69,7 @@ function expandProductRowsBySerial($row) {
     foreach ($serials as $serial) {
         $copy = $row;
         $copy['serial_number'] = $serial;
+        $copy['stock_quantity'] = 1;
         $expandedRows[] = $copy;
     }
 
@@ -85,6 +86,16 @@ function normalizeProductPayloadAliases($row) {
         foreach ($aliasKeys as $aliasKey) {
             if (isset($row[$aliasKey]) && trim((string)$row[$aliasKey]) !== '') {
                 $row['product_name'] = trim((string)$row[$aliasKey]);
+                break;
+            }
+        }
+    }
+
+    if (!isset($row['stock_quantity']) || $row['stock_quantity'] === '' || $row['stock_quantity'] === null) {
+        $stockAliasKeys = ['stockQuantity', 'quantity', 'qty'];
+        foreach ($stockAliasKeys as $aliasKey) {
+            if (array_key_exists($aliasKey, $row) && $row[$aliasKey] !== '' && $row[$aliasKey] !== null) {
+                $row['stock_quantity'] = $row[$aliasKey];
                 break;
             }
         }
@@ -118,6 +129,9 @@ class Database {
         if (!isset($existing['stock_quantity'])) {
             $conn->exec("ALTER TABLE products ADD COLUMN stock_quantity INT(10) UNSIGNED NOT NULL DEFAULT 1 AFTER price");
         }
+
+        $conn->exec("ALTER TABLE products MODIFY stock_quantity INT(10) UNSIGNED NOT NULL DEFAULT 1");
+        $conn->exec("UPDATE products SET stock_quantity = 1 WHERE stock_quantity IS NULL OR stock_quantity <= 0");
     }
 
     public function getConnection() {
@@ -917,4 +931,3 @@ try {
     ]);
 }
 ?>
-

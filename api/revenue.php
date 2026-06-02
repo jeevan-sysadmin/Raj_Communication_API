@@ -90,6 +90,17 @@ function revenue_statement(PDO $db, string $query, array $params): PDOStatement 
     return $stmt;
 }
 
+function revenue_order_date_conditions(string $fromDate, string $toDate): array {
+    $end = new DateTime($toDate . ' 00:00:00');
+    $end->modify('+1 day');
+
+    return [
+        "so.created_at >= :from_datetime",
+        "so.created_at < :to_datetime",
+        "LOWER(TRIM(COALESCE(so.payment_status, ''))) = 'paid'",
+    ];
+}
+
 $db = finance_connection();
 finance_user(false);
 
@@ -111,13 +122,10 @@ $filters = [
     'to_date' => $period['to_date'],
 ];
 
-$orderConditions = [
-    "DATE(so.created_at) BETWEEN :from_date AND :to_date",
-    "LOWER(TRIM(COALESCE(so.payment_status, ''))) = 'paid'",
-];
+$orderConditions = revenue_order_date_conditions($period['from_date'], $period['to_date']);
 $orderParams = [
-    ':from_date' => $period['from_date'],
-    ':to_date' => $period['to_date'],
+    ':from_datetime' => $period['from_date'] . ' 00:00:00',
+    ':to_datetime' => (new DateTime($period['to_date'] . ' 00:00:00'))->modify('+1 day')->format('Y-m-d H:i:s'),
 ];
 
 if ($serviceType !== 'all') {
@@ -187,6 +195,7 @@ $orderServiceRows = revenue_statement($db, "
     SELECT
         COALESCE(NULLIF(TRIM(so.service_type), ''), 'general') AS service_type,
         COALESCE(SUM(COALESCE(so.final_cost, 0)), 0) AS income,
+        COALESCE(SUM(COALESCE(so.deposit_amount, 0)), 0) AS deposit_amount_total,
         COUNT(so.id) AS order_count,
         COUNT(DISTINCT so.client_id) AS customer_count
     FROM service_orders so
@@ -200,7 +209,7 @@ foreach ($orderServiceRows as $row) {
         'service_type' => $key,
         'income' => (float)$row['income'],
         'final_cost_total' => (float)$row['income'],
-        'deposit_amount_total' => 0.0,
+        'deposit_amount_total' => (float)$row['deposit_amount_total'],
         'expenses' => 0.0,
         'salaries' => 0.0,
         'total_costs' => 0.0,
@@ -236,34 +245,6 @@ foreach ($expenseRows as $row) {
         ];
     }
     $serviceRows[$key]['expenses'] = (float)$row['expenses'];
-}
-
-$depositRows = revenue_statement($db, "
-    SELECT
-        COALESCE(NULLIF(TRIM(so.service_type), ''), 'general') AS service_type,
-        COALESCE(SUM(COALESCE(so.deposit_amount, 0)), 0) AS deposit_amount
-    FROM service_orders so
-    WHERE " . implode(' AND ', $orderConditions) . "
-    GROUP BY COALESCE(NULLIF(TRIM(so.service_type), ''), 'general')
-", $orderParams)->fetchAll(PDO::FETCH_ASSOC);
-
-foreach ($depositRows as $row) {
-    $key = $row['service_type'] ?: 'general';
-    if (!isset($serviceRows[$key])) {
-        $serviceRows[$key] = [
-            'service_type' => $key,
-            'income' => 0.0,
-            'final_cost_total' => 0.0,
-            'deposit_amount_total' => 0.0,
-            'expenses' => 0.0,
-            'salaries' => 0.0,
-            'total_costs' => 0.0,
-            'net_profit' => 0.0,
-            'order_count' => 0,
-            'customer_count' => 0,
-        ];
-    }
-    $serviceRows[$key]['deposit_amount_total'] = (float)$row['deposit_amount'];
 }
 
 $salaryRows = revenue_statement($db, "
@@ -327,7 +308,8 @@ $monthlyData = revenue_month_keys($period['from_date'], $period['to_date']);
 $orderMonthlyRows = revenue_statement($db, "
     SELECT
         DATE_FORMAT(so.created_at, '%Y-%m') AS month_key,
-        COALESCE(SUM(COALESCE(so.final_cost, 0)), 0) AS income
+        COALESCE(SUM(COALESCE(so.final_cost, 0)), 0) AS income,
+        COALESCE(SUM(COALESCE(so.deposit_amount, 0)), 0) AS deposit_amount
     FROM service_orders so
     WHERE " . implode(' AND ', $orderConditions) . "
     GROUP BY DATE_FORMAT(so.created_at, '%Y-%m')
@@ -339,22 +321,6 @@ foreach ($orderMonthlyRows as $row) {
         continue;
     }
     $monthlyData[$row['month_key']]['income'] += (float)$row['income'];
-}
-
-$depositMonthlyRows = revenue_statement($db, "
-    SELECT
-        DATE_FORMAT(so.created_at, '%Y-%m') AS month_key,
-        COALESCE(SUM(COALESCE(so.deposit_amount, 0)), 0) AS deposit_amount
-    FROM service_orders so
-    WHERE " . implode(' AND ', $orderConditions) . "
-    GROUP BY DATE_FORMAT(so.created_at, '%Y-%m')
-    ORDER BY month_key ASC
-", $orderParams)->fetchAll(PDO::FETCH_ASSOC);
-
-foreach ($depositMonthlyRows as $row) {
-    if (!isset($monthlyData[$row['month_key']])) {
-        continue;
-    }
     $monthlyData[$row['month_key']]['deposit_amount'] += (float)$row['deposit_amount'];
 }
 

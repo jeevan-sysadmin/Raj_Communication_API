@@ -375,8 +375,6 @@ function getDeliveries($conn) {
             }));
         };
 
-        // Keep DB values aligned to enum-safe values before reads.
-        normalizeDeliveryTypeRowsInDatabase($conn);
         $hasProductNamesColumn = serviceOrdersHasColumn($conn, 'product_names');
         $hasProductSerialNumbersColumn = serviceOrdersHasColumn($conn, 'product_serial_numbers');
         $productNamesSelect = $hasProductNamesColumn ? "so.product_names" : "NULL AS product_names";
@@ -536,26 +534,6 @@ function getDeliveries($conn) {
                 $delivery['scheduled_time_formatted'] = date('h:i A', strtotime($delivery['scheduled_time']));
             }
 
-            if (!empty($delivery['order_id'])) {
-                $productQuery = "SELECT p.product_name, p.brand, p.model, p.serial_number
-                                 FROM service_orders so 
-                                 LEFT JOIN products p ON COALESCE(:delivery_product_id, so.product_id) = p.id 
-                                 WHERE so.id = :order_id";
-                $productStmt = $conn->prepare($productQuery);
-                $productStmt->bindValue(':order_id', (int)$delivery['order_id'], PDO::PARAM_INT);
-                $deliveryProductId = isset($delivery['product_id']) ? (int)$delivery['product_id'] : 0;
-                $productStmt->bindValue(':delivery_product_id', $deliveryProductId > 0 ? $deliveryProductId : null, $deliveryProductId > 0 ? PDO::PARAM_INT : PDO::PARAM_NULL);
-                $productStmt->execute();
-                $product = $productStmt->fetch(PDO::FETCH_ASSOC);
-
-                if ($product) {
-                    $delivery['product_name'] = $product['product_name'];
-                    $delivery['product_brand'] = $product['brand'];
-                    $delivery['product_model'] = $product['model'];
-                    $delivery['product_serial_number'] = $product['serial_number'];
-                }
-            }
-
             if (empty($delivery['product_serial_number']) && !empty($delivery['product_name'])) {
                 $names = $parseNameList($delivery['product_names'] ?? null);
                 $serials = $parseNameList($delivery['product_serial_numbers'] ?? null);
@@ -606,9 +584,6 @@ function getDeliveries($conn) {
  */
 function createDelivery($conn) {
     try {
-        // Ensure legacy values are normalized before insert flow.
-        normalizeDeliveryTypeRowsInDatabase($conn);
-
         $data = json_decode(file_get_contents("php://input"), true);
         
         // If no JSON data, check form data
@@ -746,9 +721,6 @@ function createDelivery($conn) {
  */
 function updateDelivery($conn) {
     try {
-        // Ensure legacy values are normalized before update flow.
-        normalizeDeliveryTypeRowsInDatabase($conn);
-
         $rawInput = file_get_contents("php://input");
         $data = json_decode($rawInput, true);
         if (!is_array($data)) {

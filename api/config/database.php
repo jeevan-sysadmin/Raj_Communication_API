@@ -4,9 +4,15 @@ class Database {
     private $db_name = "raj communication";
     private $username = "root";
     private $password = "";
+    private static $sharedConn = null;
     public $conn;
 
     public function getConnection() {
+        if (self::$sharedConn instanceof PDO) {
+            $this->conn = self::$sharedConn;
+            return $this->conn;
+        }
+
         $this->conn = null;
 
         try {
@@ -22,6 +28,8 @@ class Database {
                     PDO::ATTR_TIMEOUT => 5,
                 ]
             );
+            $this->conn->exec("SET SESSION sql_mode = REPLACE(@@sql_mode, 'ONLY_FULL_GROUP_BY', '')");
+            self::$sharedConn = $this->conn;
         } catch(PDOException $exception) {
             error_log("Connection error: " . $exception->getMessage());
             $this->conn = null;

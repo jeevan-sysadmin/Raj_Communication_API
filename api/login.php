@@ -14,14 +14,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 // Include required files
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/helpers/jwt_helper.php';
+require_once __DIR__ . '/helpers/performance.php';
 
-// Set error reporting for development
+apiEnableCompression();
+
+// Keep API responses lean in production.
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
+ini_set('display_errors', 0);
 
 class LoginAPI {
     private $conn;
     private $data;
+    private static $usersTableChecked = false;
 
     public function __construct() {
         $database = new Database();
@@ -34,9 +38,9 @@ class LoginAPI {
         
         // Get input data
         $input = file_get_contents("php://input");
-        $this->data = json_decode($input);
+        $this->data = $input !== '' ? json_decode($input) : null;
         
-        if (!$this->data && json_last_error() !== JSON_ERROR_NONE) {
+        if ($input !== '' && !$this->data && json_last_error() !== JSON_ERROR_NONE) {
             $this->sendError("Invalid JSON input");
             exit();
         }
@@ -58,13 +62,9 @@ class LoginAPI {
                 return;
             }
 
-            // Check if users table exists
-            $checkTable = "SHOW TABLES LIKE 'users'";
-            $stmt = $this->conn->query($checkTable);
-            
-            if ($stmt->rowCount() == 0) {
-                // Create default users if table doesn't exist
-                $this->createDefaultUsers();
+            if (!self::$usersTableChecked) {
+                $stmt = $this->conn->query("SELECT 1 FROM users LIMIT 1");
+                self::$usersTableChecked = true;
             }
 
             // Prepare SQL query
@@ -127,9 +127,18 @@ class LoginAPI {
                 $this->sendError("Database query failed", 500);
             }
             
+        } catch (PDOException $e) {
+            if ($e->getCode() === '42S02') {
+                $this->createDefaultUsers();
+                self::$usersTableChecked = true;
+                $this->login();
+                return;
+            }
+            error_log("Login database error: " . $e->getMessage());
+            $this->sendError("Server error occurred", 500);
         } catch (Exception $e) {
             error_log("Login error: " . $e->getMessage());
-            $this->sendError("Server error occurred: " . $e->getMessage(), 500);
+            $this->sendError("Server error occurred", 500);
         }
     }
 

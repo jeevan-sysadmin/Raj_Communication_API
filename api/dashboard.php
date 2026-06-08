@@ -14,11 +14,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
 
 // Error reporting for development
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
+ini_set('display_errors', 0);
 
 // Include required files - FIXED PATH
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/middleware/Auth.php';
+require_once __DIR__ . '/helpers/performance.php';
+
+apiEnableCompression();
 
 // Initialize objects
 try {
@@ -64,6 +67,17 @@ $path_parts = $path ? explode('/', $path) : [];
 
 // Route the request based on path segments
 $action = isset($path_parts[0]) && !empty($path_parts[0]) ? $path_parts[0] : 'overview';
+
+if ($method === 'GET') {
+    $cacheTtls = [
+        'overview' => 5,
+        'stats' => 15,
+        'orders' => 5,
+    ];
+    if (isset($cacheTtls[$action]) && apiServeCachedJson('dashboard_' . $action, $cacheTtls[$action])) {
+        exit();
+    }
+}
 
 switch ($action) {
     case 'deliveries':
@@ -465,36 +479,17 @@ function deleteDelivery($conn, $path_parts) {
  */
 function getDashboardOverview($conn) {
     try {
-        // Get total clients
-        $clientsQuery = "SELECT COUNT(*) as total FROM clients";
-        $clientsStmt = $conn->query($clientsQuery);
-        $totalClients = $clientsStmt->fetch(PDO::FETCH_ASSOC)['total'];
-        
-        // Get total orders
-        $ordersQuery = "SELECT COUNT(*) as total FROM service_orders";
-        $ordersStmt = $conn->query($ordersQuery);
-        $totalOrders = $ordersStmt->fetch(PDO::FETCH_ASSOC)['total'];
-        
-        // Get pending orders (pending, process, scheduled)
-        $pendingQuery = "SELECT COUNT(*) as total FROM service_orders WHERE status IN ('pending', 'process', 'scheduled')";
-        $pendingStmt = $conn->query($pendingQuery);
-        $pendingOrders = $pendingStmt->fetch(PDO::FETCH_ASSOC)['total'];
-        
-        // Get completed orders (this month)
         $monthStart = date('Y-m-01');
-        $completedQuery = "SELECT COUNT(*) as total FROM service_orders WHERE status = 'delivered' AND DATE(updated_at) >= :month_start";
-        $completedStmt = $conn->prepare($completedQuery);
-        $completedStmt->bindParam(':month_start', $monthStart);
-        $completedStmt->execute();
-        $completedOrders = $completedStmt->fetch(PDO::FETCH_ASSOC)['total'];
-        
-        // Get total revenue (this month)
-        $revenueQuery = "SELECT SUM(final_cost) as total FROM service_orders WHERE status = 'delivered' AND DATE(updated_at) >= :month_start AND final_cost IS NOT NULL";
-        $revenueStmt = $conn->prepare($revenueQuery);
-        $revenueStmt->bindParam(':month_start', $monthStart);
-        $revenueStmt->execute();
-        $revenueResult = $revenueStmt->fetch(PDO::FETCH_ASSOC);
-        $totalRevenue = $revenueResult['total'] ?? 0;
+        $overviewQuery = "SELECT
+            (SELECT COUNT(*) FROM clients) AS total_clients,
+            (SELECT COUNT(*) FROM service_orders) AS total_orders,
+            (SELECT COUNT(*) FROM service_orders WHERE status IN ('pending', 'process', 'scheduled')) AS pending_orders,
+            (SELECT COUNT(*) FROM service_orders WHERE status = 'delivered' AND updated_at >= :month_start) AS completed_orders_month,
+            (SELECT COALESCE(SUM(final_cost), 0) FROM service_orders WHERE status = 'delivered' AND updated_at >= :month_start AND final_cost IS NOT NULL) AS total_revenue_month";
+        $overviewStmt = $conn->prepare($overviewQuery);
+        $overviewStmt->bindValue(':month_start', $monthStart);
+        $overviewStmt->execute();
+        $overview = $overviewStmt->fetch(PDO::FETCH_ASSOC) ?: [];
         
         // Get recent orders (last 5)
         $recentOrdersQuery = "SELECT so.id, so.order_code, so.status, so.priority, so.estimated_cost, 
@@ -533,20 +528,22 @@ function getDashboardOverview($conn) {
         $deliveriesStmt->execute();
         $upcomingDeliveries = $deliveriesStmt->fetchAll(PDO::FETCH_ASSOC);
         
-        echo json_encode([
+        $response = json_encode([
             'success' => true,
             'overview' => [
-                'total_clients' => (int)$totalClients,
-                'total_orders' => (int)$totalOrders,
-                'pending_orders' => (int)$pendingOrders,
-                'completed_orders_month' => (int)$completedOrders,
-                'total_revenue_month' => (float)$totalRevenue
+                'total_clients' => (int)($overview['total_clients'] ?? 0),
+                'total_orders' => (int)($overview['total_orders'] ?? 0),
+                'pending_orders' => (int)($overview['pending_orders'] ?? 0),
+                'completed_orders_month' => (int)($overview['completed_orders_month'] ?? 0),
+                'total_revenue_month' => (float)($overview['total_revenue_month'] ?? 0)
             ],
             'recent_orders' => $recentOrders,
             'low_stock_products' => $lowStockProducts,
             'upcoming_deliveries' => $upcomingDeliveries,
             'timestamp' => date('Y-m-d H:i:s')
         ]);
+        apiCacheJsonResponse('dashboard_overview', $response);
+        echo $response;
         
     } catch (PDOException $e) {
         http_response_code(500);
@@ -602,7 +599,7 @@ function getDashboardStats($conn) {
         $topProductsStmt = $conn->query($topProductsQuery);
         $topProducts = $topProductsStmt->fetchAll(PDO::FETCH_ASSOC);
         
-        echo json_encode([
+        $response = json_encode([
             'success' => true,
             'stats' => [
                 'order_status' => $orderStatus,
@@ -611,6 +608,8 @@ function getDashboardStats($conn) {
             ],
             'timestamp' => date('Y-m-d H:i:s')
         ]);
+        apiCacheJsonResponse('dashboard_stats', $response);
+        echo $response;
         
     } catch (PDOException $e) {
         http_response_code(500);
@@ -672,13 +671,15 @@ function getRecentOrders($conn) {
             }
         }
         
-        echo json_encode([
+        $response = json_encode([
             'success' => true,
             'orders' => $orders,
             'count' => count($orders),
             'limit' => $limit,
             'timestamp' => date('Y-m-d H:i:s')
         ]);
+        apiCacheJsonResponse('dashboard_orders', $response);
+        echo $response;
         
     } catch (PDOException $e) {
         http_response_code(500);

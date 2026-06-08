@@ -63,6 +63,14 @@ requireFirstAvailable([
     dirname(__DIR__) . '/helpers/jwt_helper.php'
 ], 'jwt_helper.php');
 
+requireFirstAvailable([
+    __DIR__ . '/helpers/performance.php',
+    dirname(__DIR__) . '/api_sync/helpers/performance.php',
+    dirname(__DIR__) . '/helpers/performance.php'
+], 'performance.php');
+
+apiEnableCompression();
+
 if (!class_exists('Database')) {
     sendBootstrapJsonError('Server configuration error: Database class not found', 500);
 }
@@ -480,6 +488,13 @@ function normalizeHandoverTypeMap($value) {
 function fetchTableColumns($db, $table, $forceRefresh = false) {
     static $cache = [];
     if (!$forceRefresh && isset($cache[$table])) return $cache[$table];
+    if (!$forceRefresh) {
+        $remembered = apiLoadRememberedSchema($table);
+        if (!empty($remembered)) {
+            $cache[$table] = $remembered;
+            return $remembered;
+        }
+    }
     $columns = [];
     try {
         $stmt = $db->prepare("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table");
@@ -500,10 +515,12 @@ function fetchTableColumns($db, $table, $forceRefresh = false) {
         } catch (Exception $e) {}
     }
     $cache[$table] = $columns;
+    apiRememberSchema($table, $columns);
     return $columns;
 }
 
 function ensureServiceOrderHandoverColumns($db, $orderColumns) {
+    if (!apiShouldAutoMigrateSchema()) return $orderColumns;
     $added = false;
     if (!isset($orderColumns['handover_type'])) {
         try {
@@ -521,18 +538,20 @@ function ensureServiceOrderHandoverColumns($db, $orderColumns) {
 }
 
 function ensureServiceOrderRepairingStatusColumn($db, $orderColumns) {
+    if (!apiShouldAutoMigrateSchema()) return $orderColumns;
     if (!isset($orderColumns['repairing_status_map'])) {
         try {
             $db->exec("ALTER TABLE service_orders ADD COLUMN repairing_status_map LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '{}' CHECK (json_valid(repairing_status_map)) AFTER product_status_map");
-            return fetchTableColumns($db, 'service_orders');
+            return fetchTableColumns($db, 'service_orders', true);
         } catch (Exception $e) {
-            return fetchTableColumns($db, 'service_orders');
+            return fetchTableColumns($db, 'service_orders', true);
         }
     }
-    return $added ? fetchTableColumns($db, 'service_orders', true) : $orderColumns;
+    return $orderColumns;
 }
 
 function ensureServiceOrderProductStatusDatesColumn($db, $orderColumns) {
+    if (!apiShouldAutoMigrateSchema()) return $orderColumns;
     $added = false;
     if (!isset($orderColumns['product_status_dates_map'])) {
         try {
@@ -552,6 +571,7 @@ function ensureServiceOrderProductStatusDatesColumn($db, $orderColumns) {
 }
 
 function ensureServiceOrderIssueDescriptionMapColumn($db, $orderColumns) {
+    if (!apiShouldAutoMigrateSchema()) return $orderColumns;
     if (!isset($orderColumns['issue_description_map'])) {
         try {
             $db->exec("ALTER TABLE service_orders ADD COLUMN issue_description_map LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '{}' CHECK (json_valid(issue_description_map)) AFTER repairing_status_map");
@@ -564,6 +584,7 @@ function ensureServiceOrderIssueDescriptionMapColumn($db, $orderColumns) {
 }
 
 function ensureLegacyIssueDescriptionColumnIsOptional($db, $orderColumns) {
+    if (!apiShouldAutoMigrateSchema()) return $orderColumns;
     if (!isset($orderColumns['issue_description'])) return $orderColumns;
     try {
         // Legacy compatibility: old schemas may still require issue_description.
@@ -983,6 +1004,9 @@ function getOrderWithRelations($db, $order_id) {
 try {
     switch ($method) {
         case 'GET':
+            if (apiServeCachedJson('orders', 5)) {
+                exit();
+            }
             $id = isset($_GET['id']) ? $_GET['id'] : null;
             $search = isset($_GET['search']) ? trim($_GET['search']) : '';
             $status = isset($_GET['status']) ? trim($_GET['status']) : '';
@@ -1010,7 +1034,7 @@ try {
                 }
                 $final_cost = (float)($order['final_cost'] ?: 0);
                 $balance = $final_cost - $total_paid;
-                echo json_encode([
+                $response = json_encode([
                     "success" => true,
                     "order" => $order,
                     "payments" => $payments,
@@ -1021,6 +1045,8 @@ try {
                         "balance" => $balance
                     ]
                 ]);
+                apiCacheJsonResponse('orders', $response);
+                echo $response;
                 exit();
             }
 
@@ -1190,7 +1216,9 @@ try {
                 }
                 unset($order);
             }
-            echo json_encode(["success" => true, "orders" => $orders, "count" => count($orders)]);
+            $response = json_encode(["success" => true, "orders" => $orders, "count" => count($orders)]);
+            apiCacheJsonResponse('orders', $response);
+            echo $response;
             break;
 
         case 'POST':

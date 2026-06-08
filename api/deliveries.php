@@ -18,33 +18,7 @@ error_reporting(E_ALL);
 ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 
-// Database Configuration
-class Database {
-    private $host = "localhost";
-    private $db_name = "raj communication";
-    private $username = "root";
-    private $password = "";
-    public $conn;
-
-    public function getConnection() {
-        $this->conn = null;
-
-        try {
-            $this->conn = new PDO(
-                "mysql:host=" . $this->host . ";dbname=" . $this->db_name . ";charset=utf8mb4",
-                $this->username,
-                $this->password
-            );
-            $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-            $this->conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-        } catch(PDOException $e) {
-            error_log("Database connection error: " . $e->getMessage());
-            return false;
-        }
-
-        return $this->conn;
-    }
-}
+require_once __DIR__ . '/config/database.php';
 
 // Simple Auth class
 class Auth {
@@ -343,6 +317,17 @@ function syncDeliveredProductStatusToDeliveries($conn) {
     }
 }
 
+function deliveredDeliveryWhereClause($alias = 'd') {
+    return "(
+        LOWER(TRIM(COALESCE({$alias}.status, ''))) IN ('delivered', 'deliveryed')
+        OR (
+            {$alias}.delivered_date IS NOT NULL
+            AND {$alias}.delivered_date <> ''
+            AND {$alias}.delivered_date <> '0000-00-00 00:00:00'
+        )
+    )";
+}
+
 /**
  * Get all deliveries
  */
@@ -457,8 +442,13 @@ function getDeliveries($conn) {
         $params = [];
 
         if (isset($_GET['status']) && $_GET['status'] !== '') {
-            $whereClause .= " AND d.status = :status";
-            $params[':status'] = $_GET['status'];
+            $requestedStatus = strtolower(trim((string)$_GET['status']));
+            if ($requestedStatus === 'delivered' || $requestedStatus === 'deliveryed') {
+                $whereClause .= " AND " . deliveredDeliveryWhereClause('d');
+            } else {
+                $whereClause .= " AND LOWER(TRIM(COALESCE(d.status, ''))) = :status";
+                $params[':status'] = $requestedStatus;
+            }
         }
         if (isset($_GET['delivery_person']) && $_GET['delivery_person'] !== '') {
             $whereClause .= " AND d.delivery_person = :delivery_person";

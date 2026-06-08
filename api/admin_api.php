@@ -555,7 +555,11 @@ class AdminAPI {
             case 'backup_database':
                 $this->backupDatabase();
                 break;
-                
+
+            case 'get_backup_history':
+                $this->getBackupHistory();
+                break;
+                 
             default:
                 $this->sendError("Invalid action", 400);
                 break;
@@ -606,8 +610,15 @@ class AdminAPI {
             $stmt = $this->conn->query($query);
             $stats['completed_orders'] = (int)$stmt->fetchColumn();
             
-            // Delivered orders
-            $query = "SELECT COUNT(*) as delivered_orders FROM service_orders WHERE status = 'delivered'";
+            // Delivered orders from real delivery records.
+            $query = "SELECT COUNT(*) as delivered_orders
+                     FROM deliveries
+                     WHERE LOWER(TRIM(COALESCE(status, ''))) IN ('delivered', 'deliveryed')
+                        OR (
+                            delivered_date IS NOT NULL
+                            AND delivered_date <> ''
+                            AND delivered_date <> '0000-00-00 00:00:00'
+                        )";
             $stmt = $this->conn->query($query);
             $stats['delivered_orders'] = (int)$stmt->fetchColumn();
             
@@ -2673,8 +2684,11 @@ class AdminAPI {
                 return;
             }
 
+            $backupDirectory = $this->getBackupDirectory();
+            $this->purgeOldBackupFiles($backupDirectory);
             $tablesStmt = $this->conn->query('SHOW TABLES');
             $tables = $tablesStmt->fetchAll(PDO::FETCH_COLUMN) ?: [];
+            $skippedTables = [];
 
             $dump = "-- Raj Communication Database Backup\n";
             $dump .= "-- Generated At: " . date('Y-m-d H:i:s') . "\n";
@@ -2689,47 +2703,67 @@ class AdminAPI {
 
                 $escapedTable = '`' . str_replace('`', '``', $tableName) . '`';
 
-                $createStmt = $this->conn->query("SHOW CREATE TABLE {$escapedTable}");
-                $createRow = $createStmt ? $createStmt->fetch(PDO::FETCH_ASSOC) : null;
-                $createSql = $createRow['Create Table'] ?? null;
+                try {
+                    $createStmt = $this->conn->query("SHOW CREATE TABLE {$escapedTable}");
+                    $createRow = $createStmt ? $createStmt->fetch(PDO::FETCH_ASSOC) : null;
+                    $createSql = $createRow['Create Table'] ?? null;
 
-                if (!$createSql) {
+                    if (!$createSql) {
+                        $skippedTables[] = $tableName . ' (missing CREATE TABLE metadata)';
+                        continue;
+                    }
+
+                    $dump .= "--\n-- Table structure for table {$escapedTable}\n--\n";
+                    $dump .= "DROP TABLE IF EXISTS {$escapedTable};\n";
+                    $dump .= $createSql . ";\n\n";
+
+                    $rowsStmt = $this->conn->query("SELECT * FROM {$escapedTable}");
+                    $rows = $rowsStmt ? $rowsStmt->fetchAll(PDO::FETCH_ASSOC) : [];
+
+                    if (!empty($rows)) {
+                        $columns = array_keys($rows[0]);
+                        $columnSql = implode(', ', array_map(function ($column) {
+                            return '`' . str_replace('`', '``', (string)$column) . '`';
+                        }, $columns));
+
+                        $dump .= "--\n-- Dumping data for table {$escapedTable}\n--\n";
+                        foreach ($rows as $row) {
+                            $values = [];
+                            foreach ($columns as $column) {
+                                $value = $row[$column] ?? null;
+                                if ($value === null) {
+                                    $values[] = 'NULL';
+                                } else {
+                                    $values[] = $this->conn->quote((string)$value);
+                                }
+                            }
+                            $dump .= "INSERT INTO {$escapedTable} ({$columnSql}) VALUES (" . implode(', ', $values) . ");\n";
+                        }
+                        $dump .= "\n";
+                    }
+                } catch (Exception $tableError) {
+                    $skippedTables[] = $tableName . ' (' . $tableError->getMessage() . ')';
                     continue;
                 }
+            }
 
-                $dump .= "--\n-- Table structure for table {$escapedTable}\n--\n";
-                $dump .= "DROP TABLE IF EXISTS {$escapedTable};\n";
-                $dump .= $createSql . ";\n\n";
-
-                $rowsStmt = $this->conn->query("SELECT * FROM {$escapedTable}");
-                $rows = $rowsStmt ? $rowsStmt->fetchAll(PDO::FETCH_ASSOC) : [];
-
-                if (!empty($rows)) {
-                    $columns = array_keys($rows[0]);
-                    $columnSql = implode(', ', array_map(function ($column) {
-                        return '`' . str_replace('`', '``', (string)$column) . '`';
-                    }, $columns));
-
-                    $dump .= "--\n-- Dumping data for table {$escapedTable}\n--\n";
-                    foreach ($rows as $row) {
-                        $values = [];
-                        foreach ($columns as $column) {
-                            $value = $row[$column] ?? null;
-                            if ($value === null) {
-                                $values[] = 'NULL';
-                            } else {
-                                $values[] = $this->conn->quote((string)$value);
-                            }
-                        }
-                        $dump .= "INSERT INTO {$escapedTable} ({$columnSql}) VALUES (" . implode(', ', $values) . ");\n";
-                    }
-                    $dump .= "\n";
+            if (!empty($skippedTables)) {
+                $dump .= "-- Skipped tables during backup:\n";
+                foreach ($skippedTables as $skippedTable) {
+                    $dump .= "-- " . $skippedTable . "\n";
                 }
+                $dump .= "\n";
             }
 
             $dump .= "SET FOREIGN_KEY_CHECKS=1;\n";
 
-            $fileName = 'raj_communication.sql';
+            $fileName = 'raj_communication_backup_' . date('Ymd_His') . '.sql';
+            $filePath = $backupDirectory . DIRECTORY_SEPARATOR . $fileName;
+            if (@file_put_contents($filePath, $dump) === false) {
+                $this->sendError('Failed to store backup history file on server', 500);
+                return;
+            }
+
             header_remove('Content-Type');
             header('Content-Type: application/sql');
             header('Content-Disposition: attachment; filename="' . $fileName . '"');
@@ -2740,6 +2774,54 @@ class AdminAPI {
             exit();
         } catch (Exception $e) {
             $this->sendError('Failed to generate backup: ' . $e->getMessage(), 500);
+        }
+    }
+
+    private function getBackupHistory() {
+        try {
+            $backupDirectory = $this->getBackupDirectory();
+            $this->purgeOldBackupFiles($backupDirectory);
+            $history = [];
+
+            foreach (glob($backupDirectory . DIRECTORY_SEPARATOR . '*.sql') ?: [] as $filePath) {
+                if (!is_file($filePath)) {
+                    continue;
+                }
+                $history[] = [
+                    'file_name' => basename($filePath),
+                    'file_size' => (int)filesize($filePath),
+                    'created_at' => date('Y-m-d H:i:s', (int)filemtime($filePath)),
+                ];
+            }
+
+            usort($history, function ($a, $b) {
+                return strcmp((string)$b['created_at'], (string)$a['created_at']);
+            });
+
+            $this->sendSuccess(['history' => $history]);
+        } catch (Exception $e) {
+            $this->sendError('Failed to load backup history: ' . $e->getMessage(), 500);
+        }
+    }
+
+    private function getBackupDirectory() {
+        $backupDirectory = __DIR__ . DIRECTORY_SEPARATOR . 'backups';
+        if (!is_dir($backupDirectory) && !@mkdir($backupDirectory, 0777, true) && !is_dir($backupDirectory)) {
+            throw new Exception('Unable to create backup storage directory');
+        }
+        return $backupDirectory;
+    }
+
+    private function purgeOldBackupFiles($backupDirectory, $retentionDays = 30) {
+        $cutoffTime = time() - ($retentionDays * 24 * 60 * 60);
+        foreach (glob($backupDirectory . DIRECTORY_SEPARATOR . '*.sql') ?: [] as $filePath) {
+            if (!is_file($filePath)) {
+                continue;
+            }
+            $modifiedTime = @filemtime($filePath);
+            if ($modifiedTime !== false && $modifiedTime < $cutoffTime) {
+                @unlink($filePath);
+            }
         }
     }
     

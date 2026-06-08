@@ -18,8 +18,8 @@ error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
 // Include required files
-require_once __DIR__ . '/config/database.php';
-require_once __DIR__ . '/helpers/jwt_helper.php';
+require_once __DIR__ . '/api/config/database.php';
+require_once __DIR__ . '/api/helpers/jwt_helper.php';
 
 class ImageUpload {
     private $conn;

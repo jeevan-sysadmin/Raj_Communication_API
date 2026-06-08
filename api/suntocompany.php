@@ -14,49 +14,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit();
 }
 
-class Database {
-    private $host = "localhost";
-    private $db_name = "raj communication";
-    private $username = "root";
-    private $password = "";
-    public $conn;
-
-    public function getConnection() {
-        $this->conn = null;
-        $candidates = [
-            $this->db_name,
-            'raj_communication',
-            'raj_communication'
-        ];
-
-        foreach ($candidates as $dbName) {
-            try {
-                $conn = new PDO(
-                    "mysql:host=" . $this->host . ";dbname=" . $dbName . ";charset=utf8mb4",
-                    $this->username,
-                    $this->password
-                );
-                $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-                $conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-
-                $probe = $conn->query("SHOW TABLES LIKE 'service_orders'");
-                if ($probe && $probe->fetch()) {
-                    $this->conn = $conn;
-                    return $this->conn;
-                }
-            } catch (PDOException $e) {
-                continue;
-            }
-        }
-
-        http_response_code(500);
-        echo json_encode([
-            "success" => false,
-            "message" => "Database connection failed"
-        ]);
-        exit();
-    }
-}
+require_once __DIR__ . '/config/database.php';
 
 function normalizeIdList($value) {
     if ($value === null) {
@@ -192,6 +150,9 @@ function loadCompanyNames($db, $allCompanyIds) {
 try {
     $database = new Database();
     $db = $database->getConnection();
+    if (!$db) {
+        throw new Exception("Database connection failed");
+    }
 
     $search = isset($_GET['search']) ? trim((string)$_GET['search']) : '';
     $status = isset($_GET['status']) ? trim((string)$_GET['status']) : '';

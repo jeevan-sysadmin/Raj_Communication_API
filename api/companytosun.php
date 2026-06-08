@@ -13,51 +13,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
-class Database {
-    private $host = "localhost";
-    private $db_name = "raj communication";
-    private $username = "root";
-    private $password = "";
-    public $conn;
-
-    public function getConnection() {
-        $this->conn = null;
-
-        $candidates = [
-            $this->db_name,
-            'raj_communication',
-            'raj_communication'
-        ];
-
-        foreach ($candidates as $dbName) {
-            try {
-                $conn = new PDO(
-                    "mysql:host=" . $this->host . ";dbname=" . $dbName . ";charset=utf8mb4",
-                    $this->username,
-                    $this->password
-                );
-                $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-                $conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-
-                $probe = $conn->query("SHOW TABLES LIKE 'service_orders'");
-                if ($probe && $probe->fetch()) {
-                    $this->conn = $conn;
-                    return $this->conn;
-                }
-            } catch (PDOException $e) {
-                // try next database candidate
-            }
-        }
-
-        http_response_code(500);
-        echo json_encode([
-            "success" => false,
-            "message" => "Database connection failed",
-            "error" => "No matching database found (checked: raj communication, raj_communication, raj_communication)"
-        ]);
-        exit();
-    }
-}
+require_once __DIR__ . '/config/database.php';
 
 function formatNullableDate($value, $format = 'd/m/Y') {
     if (empty($value) || $value === '0000-00-00' || $value === '0000-00-00 00:00:00') {
@@ -275,6 +231,9 @@ function buildLatestClientByProductMap($conn, $productIds) {
 try {
     $database = new Database();
     $conn = $database->getConnection();
+    if (!$conn) {
+        throw new Exception("Database connection failed");
+    }
 
     if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
         http_response_code(405);

@@ -104,69 +104,28 @@ function normalizeProductPayloadAliases($row) {
     return $row;
 }
 
-// Database class
-class Database {
-    private $host = "localhost";
-    private $db_name = "raj communication";
-    private $username = "root";
-    private $password = "";
-    public $conn;
+require_once __DIR__ . '/config/database.php';
 
-    private function ensureProductsStockColumns(PDO $conn) {
-        $checkQuery = "SELECT COLUMN_NAME
-                       FROM information_schema.COLUMNS
-                       WHERE TABLE_SCHEMA = DATABASE()
-                         AND TABLE_NAME = 'products'
-                         AND COLUMN_NAME = 'stock_quantity'";
-        $stmt = $conn->query($checkQuery);
-        $existing = [];
-        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-            if (!empty($row['COLUMN_NAME'])) {
-                $existing[$row['COLUMN_NAME']] = true;
-            }
+function ensureProductsStockColumns(PDO $conn) {
+    $checkQuery = "SELECT COLUMN_NAME
+                   FROM information_schema.COLUMNS
+                   WHERE TABLE_SCHEMA = DATABASE()
+                     AND TABLE_NAME = 'products'
+                     AND COLUMN_NAME = 'stock_quantity'";
+    $stmt = $conn->query($checkQuery);
+    $existing = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        if (!empty($row['COLUMN_NAME'])) {
+            $existing[$row['COLUMN_NAME']] = true;
         }
-
-        if (!isset($existing['stock_quantity'])) {
-            $conn->exec("ALTER TABLE products ADD COLUMN stock_quantity INT(10) UNSIGNED NOT NULL DEFAULT 1 AFTER price");
-        }
-
-        $conn->exec("ALTER TABLE products MODIFY stock_quantity INT(10) UNSIGNED NOT NULL DEFAULT 1");
-        $conn->exec("UPDATE products SET stock_quantity = 1 WHERE stock_quantity IS NULL OR stock_quantity <= 0");
     }
 
-    public function getConnection() {
-        $this->conn = null;
-        $candidates = [
-            $this->db_name,
-            'raj_communication',
-            'raj_communication'
-        ];
-
-        foreach ($candidates as $dbName) {
-            try {
-                $conn = new PDO(
-                    "mysql:host=" . $this->host . ";dbname=" . $dbName . ";charset=utf8mb4",
-                    $this->username,
-                    $this->password
-                );
-                $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-                $conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-
-                $probe = $conn->query("SHOW TABLES LIKE 'products'");
-                if ($probe && $probe->fetch()) {
-                    $this->ensureProductsStockColumns($conn);
-                    $this->conn = $conn;
-                    return $this->conn;
-                }
-            } catch (PDOException $e) {
-                continue;
-            }
-        }
-
-        http_response_code(500);
-        echo json_encode(["success" => false, "message" => "Database connection failed"]);
-        exit();
+    if (!isset($existing['stock_quantity'])) {
+        $conn->exec("ALTER TABLE products ADD COLUMN stock_quantity INT(10) UNSIGNED NOT NULL DEFAULT 1 AFTER price");
     }
+
+    $conn->exec("ALTER TABLE products MODIFY stock_quantity INT(10) UNSIGNED NOT NULL DEFAULT 1");
+    $conn->exec("UPDATE products SET stock_quantity = 1 WHERE stock_quantity IS NULL OR stock_quantity <= 0");
 }
 
 // Product class
@@ -593,6 +552,12 @@ class Product {
 // Create connection and process request
 $database = new Database();
 $db = $database->getConnection();
+if (!$db) {
+    http_response_code(500);
+    echo json_encode(["success" => false, "message" => "Database connection failed"]);
+    exit();
+}
+ensureProductsStockColumns($db);
 $product = new Product($db);
 
 $method = $_SERVER['REQUEST_METHOD'];

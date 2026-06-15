@@ -161,6 +161,128 @@ $client = new Client($db);
 
 $method = $_SERVER['REQUEST_METHOD'];
 
+function normalizeImportKey($key) {
+    $normalizedKey = strtolower(trim((string)$key));
+    $normalizedKey = preg_replace('/[\s\-\.\/]+/', '_', $normalizedKey);
+    $normalizedKey = preg_replace('/[^\w]/', '', $normalizedKey);
+    return trim((string)$normalizedKey, '_');
+}
+
+function getNormalizedImportRow($row) {
+    if (isset($row['_raw_import_row']) && is_array($row['_raw_import_row'])) {
+        $row = array_merge($row['_raw_import_row'], $row);
+    }
+
+    $normalizedRow = [];
+    foreach ($row as $key => $value) {
+        if ($key === '_raw_import_row') {
+            continue;
+        }
+
+        $normalizedKey = normalizeImportKey($key);
+        if ($normalizedKey !== '') {
+            $normalizedRow[$normalizedKey] = trim((string)($value ?? ''));
+        }
+    }
+
+    return $normalizedRow;
+}
+
+function getFirstImportValue($row, $keys) {
+    foreach ($keys as $key) {
+        $normalizedKey = normalizeImportKey($key);
+        $value = trim((string)($row[$normalizedKey] ?? ''));
+        if ($value !== '') {
+            return $value;
+        }
+    }
+
+    return '';
+}
+
+function looksLikeImportPhone($value) {
+    $digits = preg_replace('/\D+/', '', (string)$value);
+    return strlen($digits) >= 6;
+}
+
+function extractCombinedClientCell($value) {
+    $value = trim((string)$value);
+    if ($value === '') {
+        return ['full_name' => '', 'phone' => ''];
+    }
+
+    preg_match('/(?:\+?\d[\d\s\-\(\)]{5,}\d)/', $value, $matches);
+    $phone = isset($matches[0]) ? trim((string)$matches[0]) : '';
+    $full_name = trim(preg_replace('/\s+/', ' ', str_replace([';', ',', '|'], ' ', str_replace($phone, ' ', $value))));
+
+    return ['full_name' => $full_name, 'phone' => $phone];
+}
+
+function mapImportedClientRow($row) {
+    $normalizedRow = getNormalizedImportRow($row);
+    $orderedValues = array_values(array_filter(array_map(function($value) {
+        return trim((string)($value ?? ''));
+    }, array_values($normalizedRow)), function($value) {
+        return $value !== '';
+    }));
+
+    $full_name = getFirstImportValue($normalizedRow, ['full_name', 'full_name_', 'name', 'client_name', 'customer_name', 'client', 'customer']);
+    $phone = getFirstImportValue($normalizedRow, ['phone', 'phone_number', 'mobile', 'mobile_no', 'mobile_number', 'contact', 'contact_number', 'whatsapp', 'whatsapp_number']);
+    $email = getFirstImportValue($normalizedRow, ['email', 'mail']);
+    $address = getFirstImportValue($normalizedRow, ['address']);
+    $city = getFirstImportValue($normalizedRow, ['city']);
+    $state = getFirstImportValue($normalizedRow, ['state']);
+    $zip_code = getFirstImportValue($normalizedRow, ['zip_code', 'zipcode', 'pin_code', 'pincode']);
+    $notes = getFirstImportValue($normalizedRow, ['notes', 'remark', 'remarks']);
+
+    if ($full_name === '' || $phone === '') {
+        foreach ($orderedValues as $value) {
+            $combined = extractCombinedClientCell($value);
+
+            if ($full_name === '' && $combined['full_name'] !== '' && !looksLikeImportPhone($combined['full_name'])) {
+                $full_name = $combined['full_name'];
+            }
+
+            if ($phone === '' && $combined['phone'] !== '') {
+                $phone = $combined['phone'];
+            }
+
+            if ($full_name !== '' && $phone !== '') {
+                break;
+            }
+        }
+    }
+
+    if ($full_name === '') {
+        foreach ($orderedValues as $value) {
+            if (!looksLikeImportPhone($value) && filter_var($value, FILTER_VALIDATE_EMAIL) === false) {
+                $full_name = $value;
+                break;
+            }
+        }
+    }
+
+    if ($phone === '') {
+        foreach ($orderedValues as $value) {
+            if (looksLikeImportPhone($value)) {
+                $phone = $value;
+                break;
+            }
+        }
+    }
+
+    return [
+        'full_name' => trim((string)$full_name),
+        'phone' => trim((string)$phone),
+        'email' => trim((string)$email),
+        'address' => trim((string)$address),
+        'city' => trim((string)$city),
+        'state' => trim((string)$state),
+        'zip_code' => trim((string)$zip_code),
+        'notes' => trim((string)$notes),
+    ];
+}
+
 try {
     switch($method) {
         case 'GET':
@@ -185,6 +307,87 @@ try {
             
             if(!$input) {
                 $input = $_POST;
+            }
+
+            if (isset($input['clients']) && is_array($input['clients'])) {
+                $createdCount = 0;
+                $errors = [];
+
+                foreach ($input['clients'] as $index => $row) {
+                    if (!is_array($row)) {
+                        $errors[] = [
+                            "row" => $index + 1,
+                            "message" => "Invalid client row format",
+                        ];
+                        continue;
+                    }
+
+                    $mappedRow = mapImportedClientRow($row);
+                    if ($mappedRow['full_name'] === '' || $mappedRow['phone'] === '') {
+                        $errors[] = [
+                            "row" => $index + 1,
+                            "message" => "Full name and phone are required",
+                        ];
+                        continue;
+                    }
+
+                    $client->full_name = $mappedRow['full_name'];
+                    $client->email = $mappedRow['email'];
+                    $client->phone = $mappedRow['phone'];
+                    $client->address = $mappedRow['address'];
+                    $client->city = $mappedRow['city'];
+                    $client->state = $mappedRow['state'];
+                    $client->zip_code = $mappedRow['zip_code'];
+                    $client->notes = $mappedRow['notes'] !== '' ? $mappedRow['notes'] : 'Imported from CSV';
+
+                    try {
+                        if($client->create()) {
+                            $createdCount++;
+                        } else {
+                            $errors[] = [
+                                "row" => $index + 1,
+                                "message" => "Failed to create client",
+                            ];
+                        }
+                    } catch (Throwable $e) {
+                        $errors[] = [
+                            "row" => $index + 1,
+                            "message" => $e->getMessage(),
+                        ];
+                    }
+                }
+
+                $failedCount = count($errors);
+                if ($createdCount > 0 && $failedCount > 0) {
+                    http_response_code(207);
+                    echo json_encode([
+                        "success" => false,
+                        "partial" => true,
+                        "message" => "Some clients were imported successfully",
+                        "created_count" => $createdCount,
+                        "failed_count" => $failedCount,
+                        "errors" => $errors,
+                    ]);
+                } elseif ($createdCount > 0) {
+                    http_response_code(201);
+                    echo json_encode([
+                        "success" => true,
+                        "message" => "Clients imported successfully",
+                        "created_count" => $createdCount,
+                        "failed_count" => 0,
+                        "errors" => [],
+                    ]);
+                } else {
+                    http_response_code(400);
+                    echo json_encode([
+                        "success" => false,
+                        "message" => "No clients were imported",
+                        "created_count" => 0,
+                        "failed_count" => $failedCount,
+                        "errors" => $errors,
+                    ]);
+                }
+                break;
             }
             
             if(!empty($input['full_name']) && !empty($input['phone'])) {

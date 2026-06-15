@@ -437,31 +437,39 @@ class AdminAPI {
     }
     
     private function getBearerToken() {
-        $headers = getallheaders();
-        
+        $headers = [];
+        if (function_exists('getallheaders')) {
+            $headers = getallheaders();
+            if (!is_array($headers)) {
+                $headers = [];
+            }
+        }
+
+        $authHeader = '';
         if (isset($headers['Authorization'])) {
-            if (preg_match('/Bearer\s(\S+)/', $headers['Authorization'], $matches)) {
-                return $matches[1];
+            $authHeader = $headers['Authorization'];
+        } elseif (isset($headers['authorization'])) {
+            $authHeader = $headers['authorization'];
+        } elseif (function_exists('apache_request_headers')) {
+            $apacheHeaders = apache_request_headers();
+            if (isset($apacheHeaders['Authorization'])) {
+                $authHeader = $apacheHeaders['Authorization'];
+            } elseif (isset($apacheHeaders['authorization'])) {
+                $authHeader = $apacheHeaders['authorization'];
             }
         }
-        
-        // Alternative method to get token
-        $authHeader = null;
-        if (function_exists('apache_request_headers')) {
-            $headers = apache_request_headers();
-            if (isset($headers['Authorization'])) {
-                $authHeader = $headers['Authorization'];
-            }
-        }
-        
-        if (!$authHeader && isset($_SERVER['HTTP_AUTHORIZATION'])) {
+
+        if ($authHeader === '' && isset($_SERVER['HTTP_AUTHORIZATION'])) {
             $authHeader = $_SERVER['HTTP_AUTHORIZATION'];
         }
-        
+        if ($authHeader === '' && isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) {
+            $authHeader = $_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
+        }
+
         if ($authHeader && preg_match('/Bearer\s(\S+)/', $authHeader, $matches)) {
             return $matches[1];
         }
-        
+
         return null;
     }
     

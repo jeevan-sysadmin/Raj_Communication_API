@@ -128,6 +128,30 @@ function ensureProductsStockColumns(PDO $conn) {
     $conn->exec("UPDATE products SET stock_quantity = 1 WHERE stock_quantity IS NULL OR stock_quantity <= 0");
 }
 
+function ensureProductsSerialNumberAllowsDuplicates(PDO $conn) {
+    try {
+        $query = "SELECT INDEX_NAME
+                  FROM information_schema.STATISTICS
+                  WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'products'
+                  GROUP BY INDEX_NAME
+                  HAVING SUM(CASE WHEN COLUMN_NAME = 'serial_number' THEN 1 ELSE 0 END) > 0
+                     AND COUNT(*) = 1
+                     AND MIN(NON_UNIQUE) = 0";
+        $stmt = $conn->query($query);
+        $indexes = $stmt ? $stmt->fetchAll(PDO::FETCH_COLUMN) : [];
+
+        foreach ($indexes as $indexName) {
+            $safeIndex = str_replace('`', '``', (string)$indexName);
+            if ($safeIndex !== '' && strtoupper($safeIndex) !== 'PRIMARY') {
+                $conn->exec("ALTER TABLE products DROP INDEX `{$safeIndex}`");
+            }
+        }
+    } catch (Exception $e) {
+        // Leave product API usable even if index inspection fails.
+    }
+}
+
 // Product class
 class Product {
     private $conn;
@@ -339,12 +363,7 @@ class Product {
         // Validate inputs
         $this->serial_number = $this->normalizeSerialNumber($this->serial_number);
         $this->product_name = trim($this->product_name);
-        
-        // Check if serial number already exists
-        if (!empty($this->serial_number) && $this->checkSerialNumberExists($this->serial_number)) {
-            return ['success' => false, 'message' => 'Serial number already exists'];
-        }
-        
+
         // Generate product code
         $this->product_code = $this->generateUniqueProductCode();
         
@@ -415,10 +434,6 @@ class Product {
                 if ($this->isDuplicateEntryException($e)) {
                     $errorText = strtolower($e->getMessage());
 
-                    if (strpos($errorText, 'serial_number') !== false || strpos($errorText, 'ux_products_serial_number') !== false) {
-                        return ['success' => false, 'message' => 'Serial number already exists'];
-                    }
-
                     if (strpos($errorText, 'product_code') !== false) {
                         $this->product_code = $this->generateUniqueProductCode();
                         $stmt->bindParam(':product_code', $this->product_code);
@@ -442,12 +457,7 @@ class Product {
         // Validate inputs
         $this->serial_number = $this->normalizeSerialNumber($this->serial_number);
         $this->product_name = trim($this->product_name);
-        
-        // Check if serial number already exists for other product
-        if (!empty($this->serial_number) && $this->checkSerialNumberExists($this->serial_number, $this->id)) {
-            return ['success' => false, 'message' => 'Serial number already exists for another product'];
-        }
-        
+
         // Validate and set defaults
         $this->brand = !empty($this->brand) ? trim($this->brand) : null;
         $this->model = !empty($this->model) ? trim($this->model) : null;
@@ -558,6 +568,7 @@ if (!$db) {
     exit();
 }
 ensureProductsStockColumns($db);
+ensureProductsSerialNumberAllowsDuplicates($db);
 $product = new Product($db);
 
 $method = $_SERVER['REQUEST_METHOD'];

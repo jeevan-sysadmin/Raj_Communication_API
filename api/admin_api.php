@@ -36,6 +36,8 @@ class AdminAPI {
             $this->sendError("Database connection failed", 500);
             exit();
         }
+
+        $this->ensureProductsSerialNumberAllowsDuplicates();
         
         // Verify authentication
         $this->verifyAuth();
@@ -62,6 +64,30 @@ class AdminAPI {
         if ($this->user['role'] !== 'admin') {
             $this->sendError("Admin access required", 403);
             exit();
+        }
+    }
+
+    private function ensureProductsSerialNumberAllowsDuplicates(): void {
+        try {
+            $query = "SELECT INDEX_NAME
+                      FROM information_schema.STATISTICS
+                      WHERE TABLE_SCHEMA = DATABASE()
+                        AND TABLE_NAME = 'products'
+                      GROUP BY INDEX_NAME
+                      HAVING SUM(CASE WHEN COLUMN_NAME = 'serial_number' THEN 1 ELSE 0 END) > 0
+                         AND COUNT(*) = 1
+                         AND MIN(NON_UNIQUE) = 0";
+            $stmt = $this->conn->query($query);
+            $indexes = $stmt ? $stmt->fetchAll(PDO::FETCH_COLUMN) : [];
+
+            foreach ($indexes as $indexName) {
+                $safeIndex = str_replace('`', '``', (string)$indexName);
+                if ($safeIndex !== '' && strtoupper($safeIndex) !== 'PRIMARY') {
+                    $this->conn->exec("ALTER TABLE products DROP INDEX `{$safeIndex}`");
+                }
+            }
+        } catch (Exception $e) {
+            // Keep admin API usable even if index cleanup is unavailable.
         }
     }
 
@@ -373,17 +399,188 @@ class AdminAPI {
 
         $map = [];
         while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-            $map[(int)$row['id']] = $row['product_name'];
+            $productId = (int)$row['id'];
+            $productName = isset($row['product_name']) ? trim((string)$row['product_name']) : '';
+            $map[$productId] = $productName !== '' ? $productName : ('Product #' . $productId);
         }
 
         return $map;
     }
 
+    private function normalizeCompanyProductMap($value): array {
+        if ($value === null || $value === '') {
+            return [];
+        }
+
+        $parsed = $value;
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $parsed = $decoded;
+            } else {
+                return [];
+            }
+        }
+
+        if (!is_array($parsed)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($parsed as $companyId => $productIds) {
+            $cid = (int)$companyId;
+            if ($cid <= 0) {
+                continue;
+            }
+            $ids = $this->normalizeIdList($productIds);
+            if (!empty($ids)) {
+                $normalized[(string)$cid] = $ids;
+            }
+        }
+
+        return $normalized;
+    }
+
+    private function splitCompanyProductLabels($value): array {
+        $raw = trim((string)$value);
+        if ($raw === '') {
+            return [];
+        }
+
+        $parts = preg_split('/\s*(?:,|\|\||\/|[\r\n]+)\s*/', $raw);
+        if (!$parts) {
+            return [];
+        }
+
+        $labels = [];
+        foreach ($parts as $part) {
+            $label = trim((string)$part);
+            if ($label !== '') {
+                $labels[] = $label;
+            }
+        }
+
+        return $labels;
+    }
+
+    private function fetchCompaniesByIds(array $ids): array {
+        $ids = array_values(array_unique(array_filter(array_map('intval', $ids), function ($id) {
+            return $id > 0;
+        })));
+
+        if (empty($ids)) {
+            return [];
+        }
+
+        $companyTable = null;
+        if ($this->tableExists('companies')) {
+            $companyTable = 'companies';
+        } elseif ($this->tableExists('companys')) {
+            $companyTable = 'companys';
+        }
+
+        if ($companyTable === null) {
+            return [];
+        }
+
+        $companyColumns = $this->getTableColumns($companyTable);
+        $selectFields = ['id'];
+        if (isset($companyColumns['company_name'])) {
+            $selectFields[] = 'company_name AS company_name';
+        } elseif (isset($companyColumns['name'])) {
+            $selectFields[] = 'name AS company_name';
+        } else {
+            $selectFields[] = "'' AS company_name";
+        }
+        if (isset($companyColumns['product'])) {
+            $selectFields[] = 'product';
+        } else {
+            $selectFields[] = "'' AS product";
+        }
+
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $query = "SELECT " . implode(', ', $selectFields) . " FROM {$companyTable} WHERE id IN ($placeholders)";
+        $stmt = $this->conn->prepare($query);
+        $stmt->execute($ids);
+
+        $map = [];
+        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+            $companyId = (int)$row['id'];
+            $map[$companyId] = [
+                'company_name' => isset($row['company_name']) ? trim((string)$row['company_name']) : '',
+                'product' => isset($row['product']) ? trim((string)$row['product']) : '',
+            ];
+        }
+
+        return $map;
+    }
+
+    private function tableExists(string $table): bool {
+        return !empty($this->getTableColumns($table));
+    }
+
+    private function isProductIdFallbackLabel($value): bool {
+        return preg_match('/^product\s*#\s*\d+$/i', trim((string)$value)) === 1;
+    }
+
+    private function buildCompanyProductNameMap(array $companyProductMap, array $companyMetaMap, array $productNameMap): array {
+        $result = [];
+
+        foreach ($companyProductMap as $companyId => $productIds) {
+            $cid = (int)$companyId;
+            if ($cid <= 0) {
+                continue;
+            }
+
+            $companyMeta = $companyMetaMap[$cid] ?? ['company_name' => '', 'product' => ''];
+            $companyName = trim((string)($companyMeta['company_name'] ?? ''));
+            $companyProductLabels = $this->splitCompanyProductLabels($companyMeta['product'] ?? '');
+
+            $resolvedNames = [];
+            foreach (array_values($productIds) as $index => $productId) {
+                $pid = (int)$productId;
+                if ($pid <= 0) {
+                    continue;
+                }
+
+                $resolvedName = trim((string)($productNameMap[$pid] ?? ''));
+                if ($resolvedName === '' || $this->isProductIdFallbackLabel($resolvedName)) {
+                    if (isset($companyProductLabels[$index]) && $companyProductLabels[$index] !== '') {
+                        $resolvedName = $companyProductLabels[$index];
+                    } elseif (count($companyProductLabels) === 1) {
+                        $resolvedName = $companyProductLabels[0];
+                    } elseif (!empty($companyProductLabels)) {
+                        $resolvedName = $companyProductLabels[0];
+                    }
+                }
+
+                if ($resolvedName === '') {
+                    $resolvedName = 'Product #' . $pid;
+                }
+
+                $resolvedNames[] = $resolvedName;
+            }
+
+            $result[(string)$cid] = [
+                'company_name' => $companyName !== '' ? $companyName : ('Company #' . $cid),
+                'product_names' => $resolvedNames,
+            ];
+        }
+
+        return $result;
+    }
+
     private function buildNamesFromIds(array $ids, array $nameMap): array {
         $names = [];
         foreach ($ids as $id) {
+            $id = (int)$id;
+            if ($id <= 0) {
+                continue;
+            }
             if (isset($nameMap[$id])) {
                 $names[] = $nameMap[$id];
+            } else {
+                $names[] = 'Product #' . $id;
             }
         }
         return $names;
@@ -968,6 +1165,8 @@ class AdminAPI {
                 $stored_primary_by_order = [];
                 $stored_replacement_by_order = [];
                 $stored_ids = [];
+                $company_ids = [];
+                $company_product_maps_by_order = [];
 
                 foreach ($orders as $order) {
                     $orderId = (int)$order['id'];
@@ -987,9 +1186,18 @@ class AdminAPI {
                             $stored_ids = array_merge($stored_ids, $ids);
                         }
                     }
+
+                    $companyProductMap = $this->normalizeCompanyProductMap(
+                        $order['company_product_map'] ?? ($order['companies_products'] ?? null)
+                    );
+                    if (!empty($companyProductMap)) {
+                        $company_product_maps_by_order[$orderId] = $companyProductMap;
+                        $company_ids = array_merge($company_ids, array_map('intval', array_keys($companyProductMap)));
+                    }
                 }
 
                 $stored_names_map = !empty($stored_ids) ? $this->fetchProductNamesByIds($stored_ids) : [];
+                $company_meta_map = !empty($company_ids) ? $this->fetchCompaniesByIds($company_ids) : [];
 
                 foreach ($orders as &$order) {
                     $orderId = (int)$order['id'];
@@ -1021,6 +1229,47 @@ class AdminAPI {
                         $order['replacement_product_ids'] = $replacementId > 0 ? [$replacementId] : [];
                         $order['replacement_product_names'] = !empty($order['replacement_product_name']) ? [$order['replacement_product_name']] : [];
                     }
+
+                    $companyProductMap = $company_product_maps_by_order[$orderId] ?? [];
+                    if (!empty($companyProductMap)) {
+                        $order['company_product_name_map'] = $this->buildCompanyProductNameMap(
+                            $companyProductMap,
+                            $company_meta_map,
+                            $stored_names_map
+                        );
+
+                        if (!empty($order['product_names'])) {
+                            foreach ($order['product_names'] as $nameIndex => $existingName) {
+                                if (!$this->isProductIdFallbackLabel($existingName)) {
+                                    continue;
+                                }
+
+                                foreach ($order['company_product_name_map'] as $companyEntry) {
+                                    $fallbackNames = isset($companyEntry['product_names']) && is_array($companyEntry['product_names'])
+                                        ? $companyEntry['product_names']
+                                        : [];
+                                    if (isset($fallbackNames[$nameIndex]) && trim((string)$fallbackNames[$nameIndex]) !== '') {
+                                        $order['product_names'][$nameIndex] = trim((string)$fallbackNames[$nameIndex]);
+                                        break;
+                                    }
+                                    if (!empty($fallbackNames)) {
+                                        $order['product_names'][$nameIndex] = trim((string)$fallbackNames[0]);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if ((empty($order['product_name']) || trim((string)$order['product_name']) === '') && !empty($order['product_names'])) {
+                        $order['product_name'] = trim((string)$order['product_names'][0]);
+                    } elseif ($this->isProductIdFallbackLabel($order['product_name'] ?? '') && !empty($order['product_names'])) {
+                        $order['product_name'] = trim((string)$order['product_names'][0]);
+                    }
+
+                    if ((empty($order['replacement_product_name']) || trim((string)$order['replacement_product_name']) === '') && !empty($order['replacement_product_names'])) {
+                        $order['replacement_product_name'] = trim((string)$order['replacement_product_names'][0]);
+                    }
                 }
                 unset($order);
             }
@@ -1049,12 +1298,6 @@ class AdminAPI {
             $this->conn->beginTransaction();
             
             try {
-                // First, check if client exists or create new
-                $clientQuery = "SELECT id FROM clients WHERE phone = :phone LIMIT 1";
-                $clientStmt = $this->conn->prepare($clientQuery);
-                $clientStmt->bindValue(':phone', $data['client_phone'], PDO::PARAM_STR);
-                $clientStmt->execute();
-                
                 $client_id = isset($data['client_id']) && !empty($data['client_id']) ? (int)$data['client_id'] : null;
                 if ($client_id) {
                     $existingClientQuery = "SELECT id FROM clients WHERE id = :id LIMIT 1";
@@ -1075,33 +1318,22 @@ class AdminAPI {
                 }
 
                 if (!$client_id) {
-                    if ($clientStmt->rowCount() > 0) {
-                        $client = $clientStmt->fetch(PDO::FETCH_ASSOC);
-                        $client_id = $client['id'];
-                        
-                        // Update client name if different
-                        $updateClientQuery = "UPDATE clients SET full_name = :full_name, updated_at = NOW() WHERE id = :id";
-                        $updateClientStmt = $this->conn->prepare($updateClientQuery);
-                        $updateClientStmt->bindValue(':full_name', $data['client_name'], PDO::PARAM_STR);
-                        $updateClientStmt->bindValue(':id', $client_id, PDO::PARAM_INT);
-                        $updateClientStmt->execute();
+                    // Create a fresh client record when no explicit client_id was selected,
+                    // even if another client already uses the same phone number.
+                    $client_code = 'CLT' . date('Ymd') . strtoupper(substr(uniqid(), -6));
+                    $clientInsert = "INSERT INTO clients (client_code, full_name, phone, email, address, created_at) 
+                                   VALUES (:client_code, :full_name, :phone, :email, :address, NOW())";
+                    $clientInsertStmt = $this->conn->prepare($clientInsert);
+                    $clientInsertStmt->bindValue(':client_code', $client_code, PDO::PARAM_STR);
+                    $clientInsertStmt->bindValue(':full_name', $data['client_name'], PDO::PARAM_STR);
+                    $clientInsertStmt->bindValue(':phone', $data['client_phone'], PDO::PARAM_STR);
+                    $clientInsertStmt->bindValue(':email', isset($data['client_email']) ? $data['client_email'] : '', PDO::PARAM_STR);
+                    $clientInsertStmt->bindValue(':address', isset($data['client_address']) ? $data['client_address'] : '', PDO::PARAM_STR);
+                    
+                    if ($clientInsertStmt->execute()) {
+                        $client_id = $this->conn->lastInsertId();
                     } else {
-                        // Create new client only when no valid client_id and no existing phone match.
-                        $client_code = 'CLT' . date('Ymd') . strtoupper(substr(uniqid(), -6));
-                        $clientInsert = "INSERT INTO clients (client_code, full_name, phone, email, address, created_at) 
-                                       VALUES (:client_code, :full_name, :phone, :email, :address, NOW())";
-                        $clientInsertStmt = $this->conn->prepare($clientInsert);
-                        $clientInsertStmt->bindValue(':client_code', $client_code, PDO::PARAM_STR);
-                        $clientInsertStmt->bindValue(':full_name', $data['client_name'], PDO::PARAM_STR);
-                        $clientInsertStmt->bindValue(':phone', $data['client_phone'], PDO::PARAM_STR);
-                        $clientInsertStmt->bindValue(':email', isset($data['client_email']) ? $data['client_email'] : '', PDO::PARAM_STR);
-                        $clientInsertStmt->bindValue(':address', isset($data['client_address']) ? $data['client_address'] : '', PDO::PARAM_STR);
-                        
-                        if ($clientInsertStmt->execute()) {
-                            $client_id = $this->conn->lastInsertId();
-                        } else {
-                            throw new Exception("Failed to create client");
-                        }
+                        throw new Exception("Failed to create client");
                     }
                 }
                 
@@ -1689,17 +1921,6 @@ class AdminAPI {
                 return;
             }
             
-            // Check if client already exists with same phone
-            $checkQuery = "SELECT id FROM clients WHERE phone = :phone";
-            $checkStmt = $this->conn->prepare($checkQuery);
-            $checkStmt->bindValue(':phone', $data['phone'], PDO::PARAM_STR);
-            $checkStmt->execute();
-            
-            if ($checkStmt->rowCount() > 0) {
-                $this->sendError("Client with this phone number already exists", 400);
-                return;
-            }
-            
             // Generate client code
             $client_code = 'CLT' . date('Ymd') . strtoupper(substr(uniqid(), -6));
             
@@ -1899,15 +2120,6 @@ class AdminAPI {
                 $productName = trim((string)$row['product_name']);
                 $serialNumber = isset($row['serial_number']) ? preg_replace('/\s+/', '', trim((string)$row['serial_number'])) : '';
 
-                if ($serialNumber !== '') {
-                    $serialCheck = $this->conn->prepare("SELECT id FROM products WHERE serial_number = :serial_number LIMIT 1");
-                    $serialCheck->bindValue(':serial_number', $serialNumber, PDO::PARAM_STR);
-                    $serialCheck->execute();
-                    if ($serialCheck->fetch(PDO::FETCH_ASSOC)) {
-                        return ['success' => false, 'message' => 'Serial number already exists'];
-                    }
-                }
-
                 $category = isset($row['category']) && trim((string)$row['category']) !== ''
                     ? trim((string)$row['category'])
                     : 'other';
@@ -2092,18 +2304,6 @@ class AdminAPI {
             $serialNumber = isset($data['serial_number'])
                 ? preg_replace('/\s+/', '', trim((string)$data['serial_number']))
                 : (string)($existingProduct['serial_number'] ?? '');
-
-            if ($serialNumber !== '') {
-                $serialCheckQuery = "SELECT id FROM products WHERE serial_number = :serial_number AND id != :id LIMIT 1";
-                $serialCheckStmt = $this->conn->prepare($serialCheckQuery);
-                $serialCheckStmt->bindValue(':serial_number', $serialNumber, PDO::PARAM_STR);
-                $serialCheckStmt->bindValue(':id', $data['id'], PDO::PARAM_INT);
-                $serialCheckStmt->execute();
-                if ($serialCheckStmt->fetch(PDO::FETCH_ASSOC)) {
-                    $this->sendError("Serial number already exists", 400);
-                    return;
-                }
-            }
 
             $validClaimTypes = ['none', 'shop_claim', 'company_claim', 'sun_to_company', 'company_to_sun'];
             $validStatuses = ['active', 'inactive', 'discontinued', 'out_of_stock'];

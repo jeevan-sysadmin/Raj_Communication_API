@@ -153,6 +153,112 @@ class AdminAPI {
         return $normalized;
     }
 
+    private function normalizeAccessoryType($value): ?string {
+        $normalized = strtolower(trim((string)$value));
+        if ($normalized === 'withoutbox') return 'without_box';
+        if ($normalized === 'withbox') return 'with_box';
+        $allowed = ['without_box', 'with_box'];
+        return in_array($normalized, $allowed, true) ? $normalized : null;
+    }
+
+    private function normalizeAccessoryTypeMap($value): array {
+        if ($value === null || $value === '') {
+            return [];
+        }
+        $parsed = $value;
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $parsed = $decoded;
+            } else {
+                return [];
+            }
+        }
+        if (!is_array($parsed)) {
+            return [];
+        }
+        $normalized = [];
+        foreach ($parsed as $productId => $accessoryType) {
+            $pid = (int)$productId;
+            if ($pid <= 0) {
+                continue;
+            }
+            $normalizedType = $this->normalizeAccessoryType($accessoryType);
+            if ($normalizedType !== null) {
+                $normalized[(string)$pid] = $normalizedType;
+            }
+        }
+        return $normalized;
+    }
+
+    private function normalizeResultTextMap($value): array {
+        if ($value === null || $value === '') {
+            return [];
+        }
+        $parsed = $value;
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $parsed = $decoded;
+            } else {
+                return [];
+            }
+        }
+        if (!is_array($parsed)) {
+            return [];
+        }
+        $normalized = [];
+        foreach ($parsed as $productId => $resultText) {
+            $pid = (int)$productId;
+            if ($pid <= 0) {
+                continue;
+            }
+            $normalized[(string)$pid] = trim((string)$resultText);
+        }
+        return $normalized;
+    }
+
+    private function normalizePositiveQuantity($value): int {
+        $quantity = (int)$value;
+        return $quantity > 0 ? $quantity : 1;
+    }
+
+    private function normalizeProductQuantityMap($value): array {
+        if ($value === null || $value === '') {
+            return [];
+        }
+
+        $parsed = $value;
+        if (is_string($value)) {
+            $trimmed = trim($value);
+            if ($trimmed === '') {
+                return [];
+            }
+            $decoded = json_decode($trimmed, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $parsed = $decoded;
+            } elseif (preg_match('/^\{\s*"(\d+)"\s*[\.:]\s*(\d+)\s*\}$/', $trimmed, $matches)) {
+                $parsed = [$matches[1] => (int)$matches[2]];
+            } else {
+                return [];
+            }
+        }
+
+        if (!is_array($parsed)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($parsed as $productId => $quantity) {
+            $pid = (int)$productId;
+            if ($pid <= 0) {
+                continue;
+            }
+            $normalized[(string)$pid] = $this->normalizePositiveQuantity($quantity);
+        }
+        return $normalized;
+    }
+
     private function encodeJsonObject($value): ?string {
         if ($value === null) return null;
         $parsed = $value;
@@ -281,6 +387,40 @@ class AdminAPI {
             $sets[] = "issue_description_map = :issue_description_map";
             $params[':issue_description_map'] = json_encode($normalizedIssueMap);
         }
+        if (isset($columns['accessory_type_map']) && array_key_exists('accessory_type_map', $data)) {
+            $incomingAccessoryMap = $this->normalizeAccessoryTypeMap($data['accessory_type_map']);
+            $normalizedAccessoryMap = [];
+            foreach ($productIds as $pid) {
+                $key = (string)$pid;
+                if (isset($incomingAccessoryMap[$key])) {
+                    $normalizedAccessoryMap[$key] = $incomingAccessoryMap[$key];
+                }
+            }
+            $sets[] = "accessory_type_map = :accessory_type_map";
+            $params[':accessory_type_map'] = !empty($normalizedAccessoryMap) ? json_encode($normalizedAccessoryMap) : '{}';
+        }
+        if (isset($columns['result_text_map']) && array_key_exists('result_text_map', $data)) {
+            $incomingResultTextMap = $this->normalizeResultTextMap($data['result_text_map']);
+            $normalizedResultTextMap = [];
+            foreach ($productIds as $pid) {
+                $key = (string)$pid;
+                $normalizedResultTextMap[$key] = isset($incomingResultTextMap[$key]) ? trim((string)$incomingResultTextMap[$key]) : '';
+            }
+            $sets[] = "result_text_map = :result_text_map";
+            $params[':result_text_map'] = !empty($normalizedResultTextMap) ? json_encode($normalizedResultTextMap) : '{}';
+        }
+        if (isset($columns['product_quantity_map']) && array_key_exists('product_quantity_map', $data)) {
+            $incomingQuantityMap = $this->normalizeProductQuantityMap($data['product_quantity_map']);
+            $normalizedQuantityMap = [];
+            foreach ($productIds as $pid) {
+                $key = (string)$pid;
+                $normalizedQuantityMap[$key] = isset($incomingQuantityMap[$key])
+                    ? $this->normalizePositiveQuantity($incomingQuantityMap[$key])
+                    : 1;
+            }
+            $sets[] = "product_quantity_map = :product_quantity_map";
+            $params[':product_quantity_map'] = json_encode($normalizedQuantityMap);
+        }
         if (isset($columns['handover_type_map']) && array_key_exists('handover_type_map', $data)) {
             $json = $this->encodeJsonObject($data['handover_type_map']);
             $sets[] = "handover_type_map = :handover_type_map";
@@ -356,7 +496,8 @@ class AdminAPI {
         $query = "SELECT sop.order_id,
                          sop.is_replacement,
                          GROUP_CONCAT(sop.product_id ORDER BY sop.sort_order SEPARATOR ',') AS product_ids,
-                         GROUP_CONCAT(p.product_name ORDER BY sop.sort_order SEPARATOR '||') AS product_names
+                         GROUP_CONCAT(p.product_name ORDER BY sop.sort_order SEPARATOR '||') AS product_names,
+                         GROUP_CONCAT(COALESCE(NULLIF(TRIM(p.serial_number), ''), '') ORDER BY sop.sort_order SEPARATOR '||') AS product_serial_numbers
                   FROM service_order_products sop
                   JOIN products p ON sop.product_id = p.id
                   WHERE sop.order_id IN ($placeholders)
@@ -375,9 +516,13 @@ class AdminAPI {
             $names = $row['product_names'] !== null && $row['product_names'] !== ''
                 ? explode('||', $row['product_names'])
                 : [];
+            $serials = $row['product_serial_numbers'] !== null && $row['product_serial_numbers'] !== ''
+                ? array_map(static fn($value) => trim((string)$value), explode('||', $row['product_serial_numbers']))
+                : [];
             $map[$orderId][$bucket] = [
                 'ids' => $ids,
-                'names' => $names
+                'names' => $names,
+                'serials' => $serials
             ];
         }
 
@@ -1114,7 +1259,10 @@ class AdminAPI {
             
             if (!empty($search)) {
                 $query .= " AND (o.order_code LIKE :search OR c.full_name LIKE :search 
-                           OR p.product_name LIKE :search OR rp.product_name LIKE :search OR u.name LIKE :search";
+                           OR p.product_name LIKE :search OR rp.product_name LIKE :search
+                           OR p.serial_number LIKE :search OR rp.serial_number LIKE :search
+                           OR o.serial_number LIKE :search OR o.product_serial_numbers LIKE :search
+                           OR u.name LIKE :search";
                 if ($serviceOrdersHasCompanyId) {
                     $query .= " OR co.company_name LIKE :search";
                 }
@@ -1209,9 +1357,11 @@ class AdminAPI {
                     if (!empty($primary_json)) {
                         $order['product_ids'] = $primary_json;
                         $order['product_names'] = $this->buildNamesFromIds($primary_json, $stored_names_map);
+                        $order['product_serial_numbers'] = $primary['serials'] ?? (isset($order['product_serial_numbers']) && is_array($order['product_serial_numbers']) ? $order['product_serial_numbers'] : []);
                     } elseif ($primary) {
                         $order['product_ids'] = $primary['ids'];
                         $order['product_names'] = $primary['names'];
+                        $order['product_serial_numbers'] = $primary['serials'] ?? [];
                     } else {
                         $primaryId = isset($order['product_id']) ? (int)$order['product_id'] : 0;
                         $order['product_ids'] = $primaryId > 0 ? [$primaryId] : [];
@@ -1221,9 +1371,11 @@ class AdminAPI {
                     if (!empty($replacement_json)) {
                         $order['replacement_product_ids'] = $replacement_json;
                         $order['replacement_product_names'] = $this->buildNamesFromIds($replacement_json, $stored_names_map);
+                        $order['replacement_product_serial_numbers'] = $replacement['serials'] ?? (isset($order['replacement_product_serial_numbers']) && is_array($order['replacement_product_serial_numbers']) ? $order['replacement_product_serial_numbers'] : []);
                     } elseif ($replacement) {
                         $order['replacement_product_ids'] = $replacement['ids'];
                         $order['replacement_product_names'] = $replacement['names'];
+                        $order['replacement_product_serial_numbers'] = $replacement['serials'] ?? [];
                     } else {
                         $replacementId = isset($order['replacement_product_id']) ? (int)$order['replacement_product_id'] : 0;
                         $order['replacement_product_ids'] = $replacementId > 0 ? [$replacementId] : [];
@@ -2425,6 +2577,11 @@ class AdminAPI {
     
     private function getDeliveries() {
         try {
+            try {
+                $this->conn->exec("ALTER TABLE deliveries ADD COLUMN is_deleted TINYINT(1) NOT NULL DEFAULT 0");
+            } catch (Exception $e) {
+                // Column may already exist.
+            }
             $status = isset($_GET['status']) ? $_GET['status'] : '';
             $date_from = isset($_GET['date_from']) ? $_GET['date_from'] : '';
             $date_to = isset($_GET['date_to']) ? $_GET['date_to'] : '';
@@ -2434,7 +2591,7 @@ class AdminAPI {
                      LEFT JOIN service_orders o ON d.order_id = o.id
                      LEFT JOIN clients c ON o.client_id = c.id
                      LEFT JOIN products p ON COALESCE(d.product_id, o.product_id) = p.id
-                     WHERE 1=1";
+                     WHERE COALESCE(d.is_deleted, 0) = 0";
             
             $params = [];
             $types = [];
@@ -2525,16 +2682,66 @@ class AdminAPI {
             }
             
             // Check if delivery exists
-            $checkQuery = "SELECT id FROM deliveries WHERE id = :id";
+            $checkQuery = "SELECT id, order_id, product_id, product_ids FROM deliveries WHERE id = :id";
             $checkStmt = $this->conn->prepare($checkQuery);
             $checkStmt->bindValue(':id', $id, PDO::PARAM_INT);
             $checkStmt->execute();
             
-            if ($checkStmt->rowCount() === 0) {
+            $deliveryRow = $checkStmt->fetch(PDO::FETCH_ASSOC);
+            if (!$deliveryRow) {
                 $this->sendError("Delivery not found", 404);
                 return;
             }
-            
+
+            $orderId = (int)($deliveryRow['order_id'] ?? 0);
+            $productIds = $this->normalizeIdList($deliveryRow['product_ids'] ?? null);
+            if (empty($productIds) && !empty($deliveryRow['product_id'])) {
+                $productIds = [(int)$deliveryRow['product_id']];
+            }
+
+            if ($orderId > 0 && !empty($productIds)) {
+                $columns = $this->getTableColumns('service_orders');
+                if (!empty($columns)) {
+                    $fetchFields = ['id'];
+                    if (isset($columns['product_status_map'])) $fetchFields[] = 'product_status_map';
+                    if (isset($columns['handover_type_map'])) $fetchFields[] = 'handover_type_map';
+                    if (isset($columns['product_status_dates_map'])) $fetchFields[] = 'product_status_dates_map';
+
+                    $orderStmt = $this->conn->prepare("SELECT " . implode(', ', $fetchFields) . " FROM service_orders WHERE id = :id LIMIT 1");
+                    $orderStmt->bindValue(':id', $orderId, PDO::PARAM_INT);
+                    $orderStmt->execute();
+                    $orderRow = $orderStmt->fetch(PDO::FETCH_ASSOC);
+
+                    if ($orderRow) {
+                        $decodeObject = static function ($value): array {
+                            if ($value === null || $value === '') return [];
+                            if (is_array($value)) return $value;
+                            if (is_string($value)) {
+                                $decoded = json_decode($value, true);
+                                if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) return $decoded;
+                            }
+                            return [];
+                        };
+
+                        $statusMap = $decodeObject($orderRow['product_status_map'] ?? null);
+                        foreach ($productIds as $productId) {
+                            $statusMap[(string)$productId] = 'pending';
+                        }
+
+                        $handoverMap = $decodeObject($orderRow['handover_type_map'] ?? null);
+                        foreach ($productIds as $productId) {
+                            unset($handoverMap[(string)$productId]);
+                        }
+
+                        $payload = [
+                            'product_status_map' => $statusMap,
+                            'handover_type_map' => $handoverMap,
+                        ];
+                        $this->updateServiceOrderExtendedFields($orderId, $payload, $productIds);
+                    }
+                }
+            }
+
             $query = "DELETE FROM deliveries WHERE id = :id";
             $stmt = $this->conn->prepare($query);
             $stmt->bindValue(':id', $id, PDO::PARAM_INT);

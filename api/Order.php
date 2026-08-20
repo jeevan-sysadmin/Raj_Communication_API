@@ -444,6 +444,45 @@ function normalizeIssueDescriptionMap($value) {
     return $normalized;
 }
 
+function normalizeAccessoryType($value) {
+    $normalized = strtolower(trim((string)$value));
+    if ($normalized === 'withoutbox') return 'without_box';
+    if ($normalized === 'withbox') return 'with_box';
+    $allowed = ['without_box', 'with_box'];
+    return in_array($normalized, $allowed, true) ? $normalized : null;
+}
+
+function normalizeAccessoryTypeMap($value) {
+    if ($value === null || $value === '') {
+        return [];
+    }
+    $parsed = $value;
+    if (is_string($value)) {
+        $decoded = json_decode($value, true);
+        if (json_last_error() === JSON_ERROR_NONE) {
+            $parsed = $decoded;
+        } else {
+            return [];
+        }
+    }
+    if (!is_array($parsed)) {
+        return [];
+    }
+    $normalized = [];
+    foreach ($parsed as $productId => $accessoryType) {
+        $pid = (int)$productId;
+        if ($pid <= 0) continue;
+        $normalizedType = normalizeAccessoryType($accessoryType);
+        if ($normalizedType === null) continue;
+        $normalized[(string)$pid] = $normalizedType;
+    }
+    return $normalized;
+}
+
+function normalizeResultTextMap($value) {
+    return normalizeIssueDescriptionMap($value);
+}
+
 function isPreviewModeRequest($input) {
     if (!is_array($input)) return false;
     if (isset($_GET['preview']) && ($_GET['preview'] === '1' || strtolower((string)$_GET['preview']) === 'true')) {
@@ -572,15 +611,34 @@ function ensureServiceOrderProductStatusDatesColumn($db, $orderColumns) {
 
 function ensureServiceOrderIssueDescriptionMapColumn($db, $orderColumns) {
     if (!apiShouldAutoMigrateSchema()) return $orderColumns;
+    $added = false;
     if (!isset($orderColumns['issue_description_map'])) {
         try {
             $db->exec("ALTER TABLE service_orders ADD COLUMN issue_description_map LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '{}' CHECK (json_valid(issue_description_map)) AFTER repairing_status_map");
-            return fetchTableColumns($db, 'service_orders', true);
-        } catch (Exception $e) {
-            return fetchTableColumns($db, 'service_orders', true);
-        }
+            $added = true;
+        } catch (Exception $e) {}
     }
-    return $orderColumns;
+    if (!isset($orderColumns['accessory_type_map'])) {
+        try {
+            $db->exec("ALTER TABLE service_orders ADD COLUMN accessory_type_map LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '{}' CHECK (json_valid(accessory_type_map)) AFTER issue_description_map");
+            $added = true;
+        } catch (Exception $e) {}
+    }
+    if (!isset($orderColumns['result_text_map'])) {
+        try {
+            $db->exec("ALTER TABLE service_orders ADD COLUMN result_text_map LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '{}' CHECK (json_valid(result_text_map)) AFTER accessory_type_map");
+            $added = true;
+        } catch (Exception $e) {}
+    }
+    try {
+        $db->exec("ALTER TABLE service_orders MODIFY COLUMN accessory_type_map LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '{}' CHECK (json_valid(accessory_type_map))");
+        $added = true;
+    } catch (Exception $e) {}
+    try {
+        $db->exec("ALTER TABLE service_orders MODIFY COLUMN result_text_map LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '{}' CHECK (json_valid(result_text_map))");
+        $added = true;
+    } catch (Exception $e) {}
+    return $added ? fetchTableColumns($db, 'service_orders', true) : $orderColumns;
 }
 
 function ensureLegacyIssueDescriptionColumnIsOptional($db, $orderColumns) {
@@ -998,6 +1056,14 @@ function getOrderWithRelations($db, $order_id) {
     $order['comtoraj_dates'] = !empty($splitStatusDates['comtoraj']) ? $splitStatusDates['comtoraj'] : (object)[];
     $order['deliveryed_dates'] = !empty($splitStatusDates['deliveryed']) ? $splitStatusDates['deliveryed'] : (object)[];
     $order['repairing_status_map'] = normalizeRepairingStatusMapForResponse($order['repairing_status_map'] ?? null);
+    if (!empty($orderColumns) && isset($orderColumns['accessory_type_map']) && array_key_exists('accessory_type_map', $order)) {
+        $order['accessory_type_map'] = normalizeAccessoryTypeMap($order['accessory_type_map']);
+    }
+    if (!empty($orderColumns) && isset($orderColumns['result_text_map']) && array_key_exists('result_text_map', $order)) {
+        $order['result_text_map'] = normalizeResultTextMap($order['result_text_map']);
+    }
+    if (empty($order['accessory_type_map'])) $order['accessory_type_map'] = (object)[];
+    if (empty($order['result_text_map'])) $order['result_text_map'] = (object)[];
     return $order;
 }
 
@@ -1213,6 +1279,14 @@ try {
                     $order['comtoraj_dates'] = !empty($splitStatusDates['comtoraj']) ? $splitStatusDates['comtoraj'] : (object)[];
                     $order['deliveryed_dates'] = !empty($splitStatusDates['deliveryed']) ? $splitStatusDates['deliveryed'] : (object)[];
                     $order['repairing_status_map'] = normalizeRepairingStatusMapForResponse($order['repairing_status_map'] ?? null);
+                    if ($hasOrderColumns && isset($orderColumns['accessory_type_map']) && array_key_exists('accessory_type_map', $order)) {
+                        $order['accessory_type_map'] = normalizeAccessoryTypeMap($order['accessory_type_map']);
+                    }
+                    if ($hasOrderColumns && isset($orderColumns['result_text_map']) && array_key_exists('result_text_map', $order)) {
+                        $order['result_text_map'] = normalizeResultTextMap($order['result_text_map']);
+                    }
+                    if (empty($order['accessory_type_map'])) $order['accessory_type_map'] = (object)[];
+                    if (empty($order['result_text_map'])) $order['result_text_map'] = (object)[];
                 }
                 unset($order);
             }
@@ -1288,6 +1362,8 @@ try {
                 $hasDeliveryedDatesColumn = $hasOrderColumns && isset($orderColumns['deliveryed_dates']);
                 $hasRepairingStatusMapColumn = $hasOrderColumns && isset($orderColumns['repairing_status_map']);
                 $hasIssueDescriptionMapColumn = $hasOrderColumns && isset($orderColumns['issue_description_map']);
+                $hasAccessoryTypeMapColumn = $hasOrderColumns && isset($orderColumns['accessory_type_map']);
+                $hasResultTextMapColumn = $hasOrderColumns && isset($orderColumns['result_text_map']);
                 $hasHandoverTypeColumn = $hasOrderColumns && isset($orderColumns['handover_type']);
                 $hasHandoverTypeMapColumn = $hasOrderColumns && isset($orderColumns['handover_type_map']);
                 $company_ids = normalizeIdList($input['company_ids'] ?? ($input['company_id'] ?? null));
@@ -1301,6 +1377,8 @@ try {
                 $incoming_product_status_dates_map = normalizeProductStatusDatesMap($input['product_status_dates_map'] ?? null);
                 $incoming_repairing_status_map = normalizeRepairingStatusMap($input['repairing_status_map'] ?? null);
                 $incoming_issue_description_map = normalizeIssueDescriptionMap($input['issue_description_map'] ?? null);
+                $incoming_accessory_type_map = normalizeAccessoryTypeMap($input['accessory_type_map'] ?? null);
+                $incoming_result_text_map = normalizeResultTextMap($input['result_text_map'] ?? null);
                 $normalized_company_product_map = [];
                 if (!empty($company_ids)) {
                     if (empty($company_product_map)) {
@@ -1388,6 +1466,22 @@ try {
                         : '';
                 }
                 $issue_description_map_json = !empty($normalized_issue_description_map) ? json_encode($normalized_issue_description_map) : '{}';
+                $normalized_accessory_type_map = [];
+                foreach ($product_ids as $product_id) {
+                    $key = (string)$product_id;
+                    if (isset($incoming_accessory_type_map[$key])) {
+                        $normalized_accessory_type_map[$key] = $incoming_accessory_type_map[$key];
+                    }
+                }
+                $accessory_type_map_json = !empty($normalized_accessory_type_map) ? json_encode($normalized_accessory_type_map) : '{}';
+                $normalized_result_text_map = [];
+                foreach ($product_ids as $product_id) {
+                    $key = (string)$product_id;
+                    $normalized_result_text_map[$key] = isset($incoming_result_text_map[$key])
+                        ? trim((string)$incoming_result_text_map[$key])
+                        : '';
+                }
+                $result_text_map_json = !empty($normalized_result_text_map) ? json_encode($normalized_result_text_map) : '{}';
                 $legacy_issue_description_value = 'N/A';
                 foreach ($normalized_issue_description_map as $issueText) {
                     $candidate = trim((string)$issueText);
@@ -1468,6 +1562,8 @@ try {
                 if ($hasDeliveryedDatesColumn) $orderAssignments[] = 'deliveryed_dates = :deliveryed_dates';
                 if ($hasRepairingStatusMapColumn) $orderAssignments[] = 'repairing_status_map = :repairing_status_map';
                 if ($hasIssueDescriptionMapColumn) $orderAssignments[] = 'issue_description_map = :issue_description_map';
+                if ($hasAccessoryTypeMapColumn) $orderAssignments[] = 'accessory_type_map = :accessory_type_map';
+                if ($hasResultTextMapColumn) $orderAssignments[] = 'result_text_map = :result_text_map';
                 if ($hasHandoverTypeColumn) $orderAssignments[] = 'handover_type = :handover_type';
                 if ($hasHandoverTypeMapColumn) $orderAssignments[] = 'handover_type_map = :handover_type_map';
                 $query = "INSERT INTO service_orders SET " . implode(', ', $orderAssignments);
@@ -1511,6 +1607,8 @@ try {
                 if ($hasDeliveryedDatesColumn) $stmt->bindValue(':deliveryed_dates', $deliveryed_dates_json, $deliveryed_dates_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if ($hasRepairingStatusMapColumn) $stmt->bindValue(':repairing_status_map', $repairing_status_map_json, $repairing_status_map_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if ($hasIssueDescriptionMapColumn) $stmt->bindValue(':issue_description_map', $issue_description_map_json, $issue_description_map_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+                if ($hasAccessoryTypeMapColumn) $stmt->bindValue(':accessory_type_map', $accessory_type_map_json, PDO::PARAM_STR);
+                if ($hasResultTextMapColumn) $stmt->bindValue(':result_text_map', $result_text_map_json, PDO::PARAM_STR);
                 if ($hasHandoverTypeColumn) $stmt->bindValue(':handover_type', $handover_type, $handover_type === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if ($hasHandoverTypeMapColumn) $stmt->bindValue(':handover_type_map', $handover_type_map_json, $handover_type_map_json === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
                 if (!$stmt->execute()) throw new Exception("Failed to create order");
@@ -1676,6 +1774,8 @@ try {
             $hasRepairingStatusMapColumn = $hasOrderColumns && isset($orderColumns['repairing_status_map']);
             $hasLegacyIssueDescriptionColumn = $hasOrderColumns && isset($orderColumns['issue_description']);
             $hasIssueDescriptionMapColumn = $hasOrderColumns && isset($orderColumns['issue_description_map']);
+            $hasAccessoryTypeMapColumn = $hasOrderColumns && isset($orderColumns['accessory_type_map']);
+            $hasResultTextMapColumn = $hasOrderColumns && isset($orderColumns['result_text_map']);
             $hasHandoverTypeColumn = $hasOrderColumns && isset($orderColumns['handover_type']);
             $hasHandoverTypeMapColumn = $hasOrderColumns && isset($orderColumns['handover_type_map']);
             
@@ -2085,6 +2185,68 @@ try {
                     $fields[] = 'issue_description = :legacy_issue_description';
                     $params[':legacy_issue_description'] = $legacyIssue;
                 }
+            }
+
+            if ($hasAccessoryTypeMapColumn && array_key_exists('accessory_type_map', $input)) {
+                $accessoryTypeMap = normalizeAccessoryTypeMap($input['accessory_type_map']);
+                $targetProductIds = [];
+                if (is_array($update_product_ids) && !empty($update_product_ids)) {
+                    $targetProductIds = $update_product_ids;
+                } else {
+                    try {
+                        $existingProductStmt = $db->prepare("SELECT product_ids, product_id FROM service_orders WHERE id = :id");
+                        $existingProductStmt->bindValue(':id', $id, PDO::PARAM_INT);
+                        $existingProductStmt->execute();
+                        $existingProductRow = $existingProductStmt->fetch(PDO::FETCH_ASSOC);
+                        if ($existingProductRow) {
+                            $targetProductIds = normalizeIdList($existingProductRow['product_ids'] ?? ($existingProductRow['product_id'] ?? null));
+                        }
+                    } catch (Exception $e) {
+                        $targetProductIds = [];
+                    }
+                }
+                if (!empty($targetProductIds)) {
+                    $normalizedAccessoryTypeMap = [];
+                    foreach ($targetProductIds as $productId) {
+                        $key = (string)$productId;
+                        if (isset($accessoryTypeMap[$key])) {
+                            $normalizedAccessoryTypeMap[$key] = $accessoryTypeMap[$key];
+                        }
+                    }
+                    $accessoryTypeMap = $normalizedAccessoryTypeMap;
+                }
+                $fields[] = 'accessory_type_map = :accessory_type_map';
+                $params[':accessory_type_map'] = !empty($accessoryTypeMap) ? json_encode($accessoryTypeMap) : '{}';
+            }
+
+            if ($hasResultTextMapColumn && array_key_exists('result_text_map', $input)) {
+                $resultTextMap = normalizeResultTextMap($input['result_text_map']);
+                $targetProductIds = [];
+                if (is_array($update_product_ids) && !empty($update_product_ids)) {
+                    $targetProductIds = $update_product_ids;
+                } else {
+                    try {
+                        $existingProductStmt = $db->prepare("SELECT product_ids, product_id FROM service_orders WHERE id = :id");
+                        $existingProductStmt->bindValue(':id', $id, PDO::PARAM_INT);
+                        $existingProductStmt->execute();
+                        $existingProductRow = $existingProductStmt->fetch(PDO::FETCH_ASSOC);
+                        if ($existingProductRow) {
+                            $targetProductIds = normalizeIdList($existingProductRow['product_ids'] ?? ($existingProductRow['product_id'] ?? null));
+                        }
+                    } catch (Exception $e) {
+                        $targetProductIds = [];
+                    }
+                }
+                if (!empty($targetProductIds)) {
+                    $normalizedResultTextMap = [];
+                    foreach ($targetProductIds as $productId) {
+                        $key = (string)$productId;
+                        $normalizedResultTextMap[$key] = isset($resultTextMap[$key]) ? trim((string)$resultTextMap[$key]) : '';
+                    }
+                    $resultTextMap = $normalizedResultTextMap;
+                }
+                $fields[] = 'result_text_map = :result_text_map';
+                $params[':result_text_map'] = !empty($resultTextMap) ? json_encode($resultTextMap) : '{}';
             }
             
             if ($hasHandoverTypeMapColumn && array_key_exists('handover_type_map', $input)) {

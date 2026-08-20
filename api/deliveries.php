@@ -236,84 +236,348 @@ function serviceOrdersHasColumn($conn, $columnName) {
     return $cache[$key];
 }
 
-function syncDeliveredProductStatusToDeliveries($conn) {
-    $hasProductStatusMapColumn = serviceOrdersHasProductStatusMapColumn($conn);
-    $productStatusMapSelect = $hasProductStatusMapColumn ? "so.product_status_map" : "NULL AS product_status_map";
+function deliveriesHasColumn($conn, $columnName) {
+    static $cache = [];
+    $key = strtolower((string)$columnName);
+    if (array_key_exists($key, $cache)) {
+        return $cache[$key];
+    }
 
-    $ordersQuery = "SELECT so.id, so.order_code, so.client_id, " . $productStatusMapSelect . ", so.created_at,
-                           c.full_name AS client_name, c.phone AS client_phone, c.address AS client_address,
-                           p.product_name
+    try {
+        $stmt = $conn->prepare("
+            SELECT 1
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'deliveries'
+              AND COLUMN_NAME = :column_name
+            LIMIT 1
+        ");
+        $stmt->bindValue(':column_name', $columnName, PDO::PARAM_STR);
+        $stmt->execute();
+        $cache[$key] = (bool)$stmt->fetchColumn();
+    } catch (Exception $e) {
+        $cache[$key] = false;
+    }
+
+    return $cache[$key];
+}
+
+function ensureDeliveriesSchemaColumns($conn) {
+    try {
+        if (!deliveriesHasColumn($conn, 'product_id')) {
+            $conn->exec("ALTER TABLE deliveries ADD COLUMN product_id INT(11) NULL AFTER notes");
+        }
+        if (!deliveriesHasColumn($conn, 'product_ids')) {
+            $conn->exec("ALTER TABLE deliveries ADD COLUMN product_ids LONGTEXT NULL AFTER product_id");
+        }
+        if (!deliveriesHasColumn($conn, 'serial_numbers')) {
+            $conn->exec("ALTER TABLE deliveries ADD COLUMN serial_numbers LONGTEXT NULL AFTER product_ids");
+        }
+        if (!deliveriesHasColumn($conn, 'serial_number')) {
+            $conn->exec("ALTER TABLE deliveries ADD COLUMN serial_number VARCHAR(255) NULL AFTER serial_numbers");
+        }
+        if (!deliveriesHasColumn($conn, 'delivery_type_map')) {
+            $conn->exec("ALTER TABLE deliveries ADD COLUMN delivery_type_map LONGTEXT NULL AFTER serial_number");
+        }
+        if (!deliveriesHasColumn($conn, 'is_deleted')) {
+            $conn->exec("ALTER TABLE deliveries ADD COLUMN is_deleted TINYINT(1) NOT NULL DEFAULT 0 AFTER delivery_type_map");
+        }
+    } catch (Exception $e) {
+        error_log('ensureDeliveriesSchemaColumns failed: ' . $e->getMessage());
+    }
+}
+
+function parseJsonArraySafe($value) {
+    if (is_array($value)) {
+        return array_values($value);
+    }
+    if (!is_string($value)) {
+        return [];
+    }
+    $trimmed = trim($value);
+    if ($trimmed === '') {
+        return [];
+    }
+    $decoded = json_decode($trimmed, true);
+    if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+        return array_values($decoded);
+    }
+    return array_values(array_filter(array_map('trim', explode(',', $trimmed)), function ($entry) {
+        return $entry !== '';
+    }));
+}
+
+function parseJsonObjectSafe($value) {
+    if (is_array($value)) {
+        return $value;
+    }
+    if (!is_string($value)) {
+        return [];
+    }
+    $trimmed = trim($value);
+    if ($trimmed === '') {
+        return [];
+    }
+    $decoded = json_decode($trimmed, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+function extractDeliveredProductIds($statusMapRaw) {
+    $statusMap = parseJsonObjectSafe($statusMapRaw);
+    $delivered = [];
+    foreach ($statusMap as $productId => $status) {
+        $pid = (int)$productId;
+        if ($pid > 0 && normalizeFlowStatus($status) === 'deliveryed') {
+            $delivered[] = $pid;
+        }
+    }
+    return array_values(array_unique($delivered));
+}
+
+function generateUniqueDeliveryCode($conn) {
+    for ($attempt = 0; $attempt < 10; $attempt++) {
+        $candidate = 'DEL' . date('YmdHis') . str_pad((string)random_int(0, 999), 3, '0', STR_PAD_LEFT);
+        $checkStmt = $conn->prepare("SELECT id FROM deliveries WHERE delivery_code = :delivery_code LIMIT 1");
+        $checkStmt->bindValue(':delivery_code', $candidate, PDO::PARAM_STR);
+        $checkStmt->execute();
+        if (!$checkStmt->fetch(PDO::FETCH_ASSOC)) {
+            return $candidate;
+        }
+        usleep(20000);
+    }
+    return 'DEL' . date('YmdHis') . str_pad((string)random_int(1000, 9999), 4, '0', STR_PAD_LEFT);
+}
+
+function syncDeliveredProductStatusToDeliveries($conn) {
+    ensureDeliveriesSchemaColumns($conn);
+
+    $hasProductStatusMapColumn = serviceOrdersHasProductStatusMapColumn($conn);
+    $hasProductIdsColumn = serviceOrdersHasColumn($conn, 'product_ids');
+    $hasHandoverTypeColumn = serviceOrdersHasColumn($conn, 'handover_type');
+    $hasHandoverTypeMapColumn = serviceOrdersHasColumn($conn, 'handover_type_map');
+    $hasProductSerialNumbersColumn = serviceOrdersHasColumn($conn, 'product_serial_numbers');
+
+    $productStatusMapSelect = $hasProductStatusMapColumn ? "so.product_status_map" : "NULL AS product_status_map";
+    $productIdsSelect = $hasProductIdsColumn ? "so.product_ids" : "NULL AS product_ids";
+    $handoverTypeSelect = $hasHandoverTypeColumn ? "so.handover_type" : "NULL AS handover_type";
+    $handoverTypeMapSelect = $hasHandoverTypeMapColumn ? "so.handover_type_map" : "NULL AS handover_type_map";
+    $productSerialNumbersSelect = $hasProductSerialNumbersColumn ? "so.product_serial_numbers" : "NULL AS product_serial_numbers";
+
+    $ordersQuery = "SELECT so.id, so.order_code, so.client_id, so.product_id, " . $productStatusMapSelect . ",
+                           " . $productIdsSelect . ", " . $handoverTypeSelect . ", " . $handoverTypeMapSelect . ",
+                           " . $productSerialNumbersSelect . ", so.created_at,
+                           c.full_name AS client_name, c.phone AS client_phone, c.address AS client_address
                     FROM service_orders so
-                    LEFT JOIN clients c ON c.id = so.client_id
-                    LEFT JOIN products p ON p.id = so.product_id";
+                    LEFT JOIN clients c ON c.id = so.client_id";
     $ordersStmt = $conn->prepare($ordersQuery);
     $ordersStmt->execute();
     $orders = $ordersStmt->fetchAll(PDO::FETCH_ASSOC);
 
-    $checkDeliveryStmt = $conn->prepare("SELECT id, status, delivered_date FROM deliveries WHERE order_id = :order_id ORDER BY id DESC LIMIT 1");
+    $existingDeliveriesStmt = $conn->prepare("
+        SELECT id, status, delivered_date, product_id, product_ids, serial_numbers, delivery_type_map, delivery_code, created_at, is_deleted
+        FROM deliveries
+        WHERE order_id = :order_id
+        ORDER BY id DESC
+    ");
+    $deleteDuplicateStmt = $conn->prepare("DELETE FROM deliveries WHERE id = :id");
     $insertDeliveryStmt = $conn->prepare(
         "INSERT INTO deliveries (
-            order_id, delivery_code, delivery_type, address, contact_person, contact_phone,
-            scheduled_date, scheduled_time, delivered_date, delivery_person, status, notes, created_at, updated_at
+            order_id, serial_number, delivery_type_map, delivery_code, delivery_type, address, contact_person, contact_phone,
+            scheduled_date, scheduled_time, delivered_date, delivery_person, status, notes, product_id, product_ids, serial_numbers, created_at, updated_at
         ) VALUES (
-            :order_id, :delivery_code, :delivery_type, :address, :contact_person, :contact_phone,
-            :scheduled_date, :scheduled_time, :delivered_date, :delivery_person, :status, :notes, NOW(), NOW()
+            :order_id, :serial_number, :delivery_type_map, :delivery_code, :delivery_type, :address, :contact_person, :contact_phone,
+            :scheduled_date, :scheduled_time, :delivered_date, :delivery_person, :status, :notes, :product_id, :product_ids, :serial_numbers, NOW(), NOW()
         )"
     );
     $updateDeliveryStmt = $conn->prepare(
         "UPDATE deliveries
          SET status = 'delivered',
+             serial_number = :serial_number,
+             delivery_type = :delivery_type,
+             delivery_type_map = :delivery_type_map,
+             address = :address,
+             contact_person = :contact_person,
+             contact_phone = :contact_phone,
+             product_id = :product_id,
+             product_ids = :product_ids,
+             serial_numbers = :serial_numbers,
+             notes = :notes,
              delivered_date = COALESCE(delivered_date, NOW()),
              updated_at = NOW()
          WHERE id = :id"
     );
 
     foreach ($orders as $order) {
-        if (!hasDeliveredProductStatus($order['product_status_map'] ?? null)) {
+        $deliveredProductIds = extractDeliveredProductIds($order['product_status_map'] ?? null);
+        if (empty($deliveredProductIds)) {
             continue;
         }
+        sort($deliveredProductIds);
 
         $orderId = (int)$order['id'];
         if ($orderId <= 0) {
             continue;
         }
 
-        $checkDeliveryStmt->bindValue(':order_id', $orderId, PDO::PARAM_INT);
-        $checkDeliveryStmt->execute();
-        $existingDelivery = $checkDeliveryStmt->fetch(PDO::FETCH_ASSOC);
-
-        if ($existingDelivery) {
-            $normalizedExisting = normalizeFlowStatus($existingDelivery['status'] ?? '');
-            if ($normalizedExisting !== 'deliveryed') {
-                $updateDeliveryStmt->bindValue(':id', (int)$existingDelivery['id'], PDO::PARAM_INT);
-                $updateDeliveryStmt->execute();
+        $productIds = parseJsonArraySafe($order['product_ids'] ?? ($order['product_id'] ?? null));
+        if (empty($productIds) && !empty($order['product_id'])) {
+            $productIds = [(int)$order['product_id']];
+        }
+        $serials = parseJsonArraySafe($order['product_serial_numbers'] ?? '');
+        $serialByProductId = [];
+        foreach ($productIds as $index => $pid) {
+            $safePid = (int)$pid;
+            if ($safePid > 0) {
+                $serialByProductId[$safePid] = trim((string)($serials[$index] ?? ''));
             }
-            continue;
         }
 
-        $deliveryCode = 'DEL' . str_pad((string)$orderId, 6, '0', STR_PAD_LEFT);
+        $handoverMap = parseJsonObjectSafe($order['handover_type_map'] ?? null);
+        $fallbackDeliveryType = normalizeDeliveryType($order['handover_type'] ?? 'inhand');
         $scheduledDate = null;
         if (!empty($order['created_at'])) {
             $scheduledDate = date('Y-m-d', strtotime($order['created_at']));
         }
 
-        $insertDeliveryStmt->bindValue(':order_id', $orderId, PDO::PARAM_INT);
-        $insertDeliveryStmt->bindValue(':delivery_code', $deliveryCode);
-        $insertDeliveryStmt->bindValue(':delivery_type', 'inhand');
-        $insertDeliveryStmt->bindValue(':address', $order['client_address'] ?: 'Address not specified');
-        $insertDeliveryStmt->bindValue(':contact_person', $order['client_name'] ?: 'Customer');
-        $insertDeliveryStmt->bindValue(':contact_phone', $order['client_phone'] ?: 'N/A');
-        $insertDeliveryStmt->bindValue(':scheduled_date', $scheduledDate, $scheduledDate ? PDO::PARAM_STR : PDO::PARAM_NULL);
-        $insertDeliveryStmt->bindValue(':scheduled_time', '09:00:00');
-        $insertDeliveryStmt->bindValue(':delivered_date', date('Y-m-d H:i:s'));
-        $insertDeliveryStmt->bindValue(':delivery_person', 'System Auto-assigned');
-        $insertDeliveryStmt->bindValue(':status', 'delivered');
-        $insertDeliveryStmt->bindValue(
-            ':notes',
-            'Auto-created from product_status_map deliveryed for order ' . ($order['order_code'] ?: ('#' . $orderId))
-                . ' - Product: ' . ($order['product_name'] ?: 'Unknown')
-        );
-        $insertDeliveryStmt->execute();
+        $productInfo = [];
+        if (!empty($deliveredProductIds)) {
+            $placeholders = implode(',', array_fill(0, count($deliveredProductIds), '?'));
+            $productStmt = $conn->prepare("SELECT id, product_name, serial_number FROM products WHERE id IN ($placeholders)");
+            $productStmt->execute($deliveredProductIds);
+            while ($productRow = $productStmt->fetch(PDO::FETCH_ASSOC)) {
+                $productInfo[(int)$productRow['id']] = $productRow;
+            }
+        }
+
+        $aggregateDeliveryTypeMap = [];
+        $aggregateSerials = [];
+        $aggregateNames = [];
+        foreach ($deliveredProductIds as $productId) {
+            $deliveryType = isset($handoverMap[(string)$productId])
+                ? normalizeDeliveryType($handoverMap[(string)$productId])
+                : $fallbackDeliveryType;
+            $aggregateDeliveryTypeMap[(string)$productId] = $deliveryType;
+
+            $serialNumber = isset($serialByProductId[$productId]) && $serialByProductId[$productId] !== ''
+                ? $serialByProductId[$productId]
+                : trim((string)($productInfo[$productId]['serial_number'] ?? ''));
+            if ($serialNumber !== '') {
+                $aggregateSerials[] = $serialNumber;
+            }
+
+            $aggregateNames[] = trim((string)($productInfo[$productId]['product_name'] ?? ("Product #{$productId}")));
+        }
+
+        $primaryProductId = (int)$deliveredProductIds[0];
+        $primaryDeliveryType = $aggregateDeliveryTypeMap[(string)$primaryProductId] ?? $fallbackDeliveryType;
+        $primarySerialNumber = $aggregateSerials[0] ?? null;
+        $deliveryTypeMapJson = json_encode($aggregateDeliveryTypeMap);
+        $productIdsJson = json_encode(array_values($deliveredProductIds));
+        $serialNumbersJson = !empty($aggregateSerials) ? json_encode(array_values($aggregateSerials)) : null;
+        $notes = 'Auto-created from delivered products for order '
+            . ($order['order_code'] ?: ('#' . $orderId))
+            . ' - Products: ' . implode(', ', $aggregateNames);
+
+        $existingDeliveriesStmt->bindValue(':order_id', $orderId, PDO::PARAM_INT);
+        $existingDeliveriesStmt->execute();
+        $existingRows = $existingDeliveriesStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $primaryRow = null;
+        $duplicateRowIds = [];
+        $hasDeletedRow = false;
+        foreach ($existingRows as $index => $existingRow) {
+            if ((int)($existingRow['is_deleted'] ?? 0) === 1) {
+                $hasDeletedRow = true;
+            }
+            if ($index === 0) {
+                $primaryRow = $existingRow;
+            } else {
+                $duplicateRowIds[] = (int)$existingRow['id'];
+            }
+        }
+
+        if ($hasDeletedRow) {
+            continue;
+        }
+
+        if ($primaryRow) {
+            $existingDeliveryTypeMap = parseJsonObjectSafe($primaryRow['delivery_type_map'] ?? null);
+            $existingProductIds = parseJsonArraySafe($primaryRow['product_ids'] ?? null);
+            $existingSerials = parseJsonArraySafe($primaryRow['serial_numbers'] ?? null);
+            $existingSerialByProductId = [];
+            foreach ($existingProductIds as $existingIndex => $existingProductId) {
+                $safeExistingProductId = (int)$existingProductId;
+                if ($safeExistingProductId > 0) {
+                    $existingSerialByProductId[$safeExistingProductId] = trim((string)($existingSerials[$existingIndex] ?? ''));
+                }
+            }
+
+            $preservedDeliveryTypeMap = [];
+            $preservedSerials = [];
+            foreach ($deliveredProductIds as $productId) {
+                $existingType = isset($existingDeliveryTypeMap[(string)$productId])
+                    ? normalizeDeliveryType($existingDeliveryTypeMap[(string)$productId])
+                    : '';
+                $resolvedType = isValidDeliveryType($existingType)
+                    ? $existingType
+                    : ($aggregateDeliveryTypeMap[(string)$productId] ?? $fallbackDeliveryType);
+                $preservedDeliveryTypeMap[(string)$productId] = $resolvedType;
+
+                $resolvedSerial = trim((string)($existingSerialByProductId[$productId] ?? ''));
+                if ($resolvedSerial === '') {
+                    $resolvedSerial = isset($serialByProductId[$productId]) && $serialByProductId[$productId] !== ''
+                        ? $serialByProductId[$productId]
+                        : trim((string)($productInfo[$productId]['serial_number'] ?? ''));
+                }
+                if ($resolvedSerial !== '') {
+                    $preservedSerials[] = $resolvedSerial;
+                }
+            }
+
+            $primaryDeliveryType = $preservedDeliveryTypeMap[(string)$primaryProductId] ?? $primaryDeliveryType;
+            $primarySerialNumber = $preservedSerials[0] ?? $primarySerialNumber;
+            $deliveryTypeMapJson = json_encode($preservedDeliveryTypeMap);
+            $serialNumbersJson = !empty($preservedSerials) ? json_encode(array_values($preservedSerials)) : $serialNumbersJson;
+
+            $updateDeliveryStmt->bindValue(':id', (int)$primaryRow['id'], PDO::PARAM_INT);
+            $updateDeliveryStmt->bindValue(':serial_number', $primarySerialNumber, $primarySerialNumber !== null ? PDO::PARAM_STR : PDO::PARAM_NULL);
+            $updateDeliveryStmt->bindValue(':delivery_type', $primaryDeliveryType, PDO::PARAM_STR);
+            $updateDeliveryStmt->bindValue(':delivery_type_map', $deliveryTypeMapJson, PDO::PARAM_STR);
+            $updateDeliveryStmt->bindValue(':address', $order['client_address'] ?: 'Address not specified', PDO::PARAM_STR);
+            $updateDeliveryStmt->bindValue(':contact_person', $order['client_name'] ?: 'Customer', PDO::PARAM_STR);
+            $updateDeliveryStmt->bindValue(':contact_phone', $order['client_phone'] ?: 'N/A', PDO::PARAM_STR);
+            $updateDeliveryStmt->bindValue(':product_id', $primaryProductId, PDO::PARAM_INT);
+            $updateDeliveryStmt->bindValue(':product_ids', $productIdsJson, PDO::PARAM_STR);
+            $updateDeliveryStmt->bindValue(':serial_numbers', $serialNumbersJson, $serialNumbersJson !== null ? PDO::PARAM_STR : PDO::PARAM_NULL);
+            $updateDeliveryStmt->bindValue(':notes', $notes, PDO::PARAM_STR);
+            $updateDeliveryStmt->execute();
+        } else {
+            $insertDeliveryStmt->bindValue(':order_id', $orderId, PDO::PARAM_INT);
+            $insertDeliveryStmt->bindValue(':serial_number', $primarySerialNumber, $primarySerialNumber !== null ? PDO::PARAM_STR : PDO::PARAM_NULL);
+            $insertDeliveryStmt->bindValue(':delivery_type_map', $deliveryTypeMapJson, PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':delivery_code', generateUniqueDeliveryCode($conn), PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':delivery_type', $primaryDeliveryType, PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':address', $order['client_address'] ?: 'Address not specified', PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':contact_person', $order['client_name'] ?: 'Customer', PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':contact_phone', $order['client_phone'] ?: 'N/A', PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':scheduled_date', $scheduledDate, $scheduledDate ? PDO::PARAM_STR : PDO::PARAM_NULL);
+            $insertDeliveryStmt->bindValue(':scheduled_time', '09:00:00', PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':delivered_date', date('Y-m-d H:i:s'), PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':delivery_person', 'System Auto-assigned', PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':status', 'delivered', PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':notes', $notes, PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':product_id', $primaryProductId, PDO::PARAM_INT);
+            $insertDeliveryStmt->bindValue(':product_ids', $productIdsJson, PDO::PARAM_STR);
+            $insertDeliveryStmt->bindValue(':serial_numbers', $serialNumbersJson, $serialNumbersJson !== null ? PDO::PARAM_STR : PDO::PARAM_NULL);
+            $insertDeliveryStmt->execute();
+        }
+
+        foreach ($duplicateRowIds as $duplicateId) {
+            if ($duplicateId > 0) {
+                $deleteDuplicateStmt->bindValue(':id', $duplicateId, PDO::PARAM_INT);
+                $deleteDuplicateStmt->execute();
+            }
+        }
     }
 }
 
@@ -333,6 +597,9 @@ function deliveredDeliveryWhereClause($alias = 'd') {
  */
 function getDeliveries($conn) {
     try {
+        normalizeDeliveryTypeRowsInDatabase($conn);
+        syncDeliveredProductStatusToDeliveries($conn);
+
         $parseNameList = function ($value): array {
             if (is_array($value)) {
                 return array_values(array_filter(array_map(function ($entry) {
@@ -369,7 +636,7 @@ function getDeliveries($conn) {
             $query = "SELECT d.*,
                              COALESCE(NULLIF(d.delivery_type, ''), 'inhand') AS delivery_type,
                              o.order_code, 
-                             so.product_ids,
+                             so.product_ids AS order_product_ids,
                              {$productNamesSelect},
                              {$productSerialsSelect},
                              so.product_status_map,
@@ -387,7 +654,8 @@ function getDeliveries($conn) {
                       LEFT JOIN service_orders so ON d.order_id = so.id
                       LEFT JOIN clients c ON o.client_id = c.id
                       LEFT JOIN products p ON p.id = COALESCE(d.product_id, so.product_id)
-                      WHERE d.id = :id";
+                      WHERE d.id = :id
+                        AND COALESCE(d.is_deleted, 0) = 0";
 
             $stmt = $conn->prepare($query);
             $stmt->bindValue(':id', (int)$_GET['id'], PDO::PARAM_INT);
@@ -438,7 +706,7 @@ function getDeliveries($conn) {
             return;
         }
 
-        $whereClause = " WHERE 1=1";
+        $whereClause = " WHERE COALESCE(d.is_deleted, 0) = 0";
         $params = [];
 
         if (isset($_GET['status']) && $_GET['status'] !== '') {
@@ -478,7 +746,7 @@ function getDeliveries($conn) {
         $query = "SELECT d.*,
                          COALESCE(NULLIF(d.delivery_type, ''), 'inhand') AS delivery_type,
                          o.order_code, 
-                         so.product_ids,
+                         so.product_ids AS order_product_ids,
                          {$productNamesSelect},
                          {$productSerialsSelect},
                          so.product_status_map,
@@ -497,7 +765,7 @@ function getDeliveries($conn) {
                   LEFT JOIN clients c ON o.client_id = c.id
                   LEFT JOIN products p ON p.id = COALESCE(d.product_id, so.product_id)
                   {$whereClause}
-                  ORDER BY d.scheduled_date DESC, d.scheduled_time DESC";
+                  ORDER BY COALESCE(d.delivered_date, d.updated_at, d.created_at, TIMESTAMP(d.scheduled_date, d.scheduled_time)) DESC, d.id DESC";
 
         $stmt = $conn->prepare($query);
         foreach ($params as $key => $value) {
@@ -574,6 +842,7 @@ function getDeliveries($conn) {
  */
 function createDelivery($conn) {
     try {
+        ensureDeliveriesSchemaColumns($conn);
         $data = json_decode(file_get_contents("php://input"), true);
         
         // If no JSON data, check form data
@@ -623,23 +892,14 @@ function createDelivery($conn) {
         // Generate delivery code
         $delivery_code = 'DEL' . date('Ymd') . strtoupper(substr(uniqid(), -6));
         
-        $query = "INSERT INTO deliveries (
-            order_id, delivery_code, delivery_type, address,
-            contact_person, contact_phone, scheduled_date,
-            scheduled_time, delivery_person, status, notes
-        ) VALUES (
-            :order_id, :delivery_code, :delivery_type, :address,
-            :contact_person, :contact_phone, :scheduled_date,
-            :scheduled_time, :delivery_person, :status, :notes
-        )";
-        
-        $stmt = $conn->prepare($query);
-        
-        // Set default status if not provided (use 'scheduled' to match your database enum)
-        $status = isset($data['status']) ? $data['status'] : 'scheduled';
-        
-        $stmt->bindParam(':order_id', $data['order_id'], PDO::PARAM_INT);
-        $stmt->bindParam(':delivery_code', $delivery_code);
+        $deliveryProductId = isset($data['product_id']) ? (int)$data['product_id'] : 0;
+        if ($deliveryProductId <= 0) {
+            $orderProductStmt = $conn->prepare("SELECT product_id FROM service_orders WHERE id = :order_id LIMIT 1");
+            $orderProductStmt->bindParam(':order_id', $data['order_id'], PDO::PARAM_INT);
+            $orderProductStmt->execute();
+            $orderProductRow = $orderProductStmt->fetch(PDO::FETCH_ASSOC);
+            $deliveryProductId = (int)($orderProductRow['product_id'] ?? 0);
+        }
         $deliveryType = normalizeDeliveryType($data['delivery_type']);
         if (!isValidDeliveryType($deliveryType)) {
             http_response_code(400);
@@ -649,6 +909,27 @@ function createDelivery($conn) {
             ]);
             return;
         }
+        $deliveryTypeMapJson = $deliveryProductId > 0 ? json_encode([(string)$deliveryProductId => $deliveryType]) : '{}';
+        $productIdsJson = $deliveryProductId > 0 ? json_encode([$deliveryProductId]) : null;
+
+        $query = "INSERT INTO deliveries (
+            order_id, delivery_type_map, delivery_code, delivery_type, address,
+            contact_person, contact_phone, scheduled_date,
+            scheduled_time, delivery_person, status, notes, product_id, product_ids
+        ) VALUES (
+            :order_id, :delivery_type_map, :delivery_code, :delivery_type, :address,
+            :contact_person, :contact_phone, :scheduled_date,
+            :scheduled_time, :delivery_person, :status, :notes, :product_id, :product_ids
+        )";
+        
+        $stmt = $conn->prepare($query);
+        
+        // Set default status if not provided (use 'scheduled' to match your database enum)
+        $status = isset($data['status']) ? $data['status'] : 'scheduled';
+        
+        $stmt->bindParam(':order_id', $data['order_id'], PDO::PARAM_INT);
+        $stmt->bindValue(':delivery_type_map', $deliveryTypeMapJson, PDO::PARAM_STR);
+        $stmt->bindParam(':delivery_code', $delivery_code);
         $stmt->bindParam(':delivery_type', $deliveryType);
         $stmt->bindParam(':address', $data['address']);
         $stmt->bindParam(':contact_person', $data['contact_person']);
@@ -658,6 +939,8 @@ function createDelivery($conn) {
         $stmt->bindParam(':delivery_person', $data['delivery_person'] ?? null);
         $stmt->bindParam(':status', $status);
         $stmt->bindParam(':notes', $data['notes'] ?? null);
+        $stmt->bindValue(':product_id', $deliveryProductId > 0 ? $deliveryProductId : null, $deliveryProductId > 0 ? PDO::PARAM_INT : PDO::PARAM_NULL);
+        $stmt->bindValue(':product_ids', $productIdsJson, $productIdsJson !== null ? PDO::PARAM_STR : PDO::PARAM_NULL);
         
         if ($stmt->execute()) {
             $delivery_id = $conn->lastInsertId();
@@ -711,6 +994,7 @@ function createDelivery($conn) {
  */
 function updateDelivery($conn) {
     try {
+        ensureDeliveriesSchemaColumns($conn);
         $rawInput = file_get_contents("php://input");
         $data = json_decode($rawInput, true);
         if (!is_array($data)) {
@@ -736,7 +1020,7 @@ function updateDelivery($conn) {
         }
         
         // Check if delivery exists
-        $checkQuery = "SELECT id, status FROM deliveries WHERE id = :id";
+        $checkQuery = "SELECT id, status, product_id, product_ids, delivery_type_map, order_id FROM deliveries WHERE id = :id";
         $checkStmt = $conn->prepare($checkQuery);
         $id = (int)$id;
         $checkStmt->bindParam(':id', $id, PDO::PARAM_INT);
@@ -749,10 +1033,82 @@ function updateDelivery($conn) {
         }
         
         $currentDelivery = $checkStmt->fetch(PDO::FETCH_ASSOC);
+        $currentProductId = (int)($currentDelivery['product_id'] ?? 0);
+        $currentOrderId = (int)($currentDelivery['order_id'] ?? 0);
+        if ($currentProductId <= 0 && !empty($currentDelivery['order_id'])) {
+            $orderProductStmt = $conn->prepare("SELECT product_id FROM service_orders WHERE id = :order_id LIMIT 1");
+            $orderProductStmt->bindValue(':order_id', (int)$currentDelivery['order_id'], PDO::PARAM_INT);
+            $orderProductStmt->execute();
+            $orderProductRow = $orderProductStmt->fetch(PDO::FETCH_ASSOC);
+            $currentProductId = (int)($orderProductRow['product_id'] ?? 0);
+        }
+
+        $resolveSerialNumbersForProductIds = function ($orderId, $productIds) use ($conn) {
+            $normalizedIds = array_values(array_filter(array_map('intval', is_array($productIds) ? $productIds : []), function ($id) {
+                return $id > 0;
+            }));
+            if ((int)$orderId <= 0 || empty($normalizedIds)) {
+                return [];
+            }
+
+            $serialByProductId = [];
+            try {
+                $orderStmt = $conn->prepare("SELECT product_ids, product_serial_numbers FROM service_orders WHERE id = :order_id LIMIT 1");
+                $orderStmt->bindValue(':order_id', (int)$orderId, PDO::PARAM_INT);
+                $orderStmt->execute();
+                $orderRow = $orderStmt->fetch(PDO::FETCH_ASSOC);
+                if ($orderRow) {
+                    $orderProductIds = parseJsonArraySafe($orderRow['product_ids'] ?? null);
+                    $orderSerials = parseJsonArraySafe($orderRow['product_serial_numbers'] ?? null);
+                    foreach ($orderProductIds as $index => $productId) {
+                        $safeProductId = (int)$productId;
+                        if ($safeProductId > 0) {
+                            $serialByProductId[$safeProductId] = trim((string)($orderSerials[$index] ?? ''));
+                        }
+                    }
+                }
+            } catch (Exception $e) {
+                // fallback to products table below
+            }
+
+            $missingIds = array_values(array_filter($normalizedIds, function ($productId) use ($serialByProductId) {
+                return !isset($serialByProductId[$productId]) || $serialByProductId[$productId] === '';
+            }));
+
+            if (!empty($missingIds)) {
+                $placeholders = implode(',', array_fill(0, count($missingIds), '?'));
+                $productStmt = $conn->prepare("SELECT id, serial_number FROM products WHERE id IN ($placeholders)");
+                $productStmt->execute($missingIds);
+                while ($productRow = $productStmt->fetch(PDO::FETCH_ASSOC)) {
+                    $safeProductId = (int)($productRow['id'] ?? 0);
+                    if ($safeProductId > 0) {
+                        $serialByProductId[$safeProductId] = trim((string)($productRow['serial_number'] ?? ''));
+                    }
+                }
+            }
+
+            $serials = [];
+            foreach ($normalizedIds as $productId) {
+                $serial = trim((string)($serialByProductId[$productId] ?? ''));
+                if ($serial !== '') {
+                    $serials[] = $serial;
+                }
+            }
+
+            return $serials;
+        };
         
         // Build update query dynamically
         $fields = [];
         $params = [':id' => $id];
+        $setField = function ($field, $paramKey, $value) use (&$fields, &$params) {
+            $assignment = "{$field} = {$paramKey}";
+            $fields = array_values(array_filter($fields, function ($entry) use ($field) {
+                return strpos($entry, "{$field} = ") !== 0;
+            }));
+            $fields[] = $assignment;
+            $params[$paramKey] = $value;
+        };
         
         // Define allowed fields to update
         $allowed_fields = [
@@ -780,9 +1136,83 @@ function updateDelivery($conn) {
                         return;
                     }
                 }
-                $fields[] = "{$field} = :{$field}";
-                $params[":{$field}"] = $data[$field];
+                $setField($field, ":{$field}", $data[$field]);
             }
+        }
+
+        if (isset($data['delivery_type_map']) && is_array($data['delivery_type_map'])) {
+            $normalizedMap = [];
+            foreach ($data['delivery_type_map'] as $productId => $deliveryType) {
+                $normalizedProductId = (int)$productId;
+                if ($normalizedProductId <= 0) {
+                    continue;
+                }
+                $normalizedType = normalizeDeliveryType($deliveryType);
+                if (!isValidDeliveryType($normalizedType)) {
+                    http_response_code(400);
+                    echo json_encode([
+                        'success' => false,
+                        'message' => 'Invalid delivery_type_map. Allowed: inhand, courier, parcelservice'
+                    ]);
+                    return;
+                }
+                $normalizedMap[(string)$normalizedProductId] = $normalizedType;
+            }
+
+            if (!empty($normalizedMap)) {
+                $productIds = array_values(array_map('intval', array_keys($normalizedMap)));
+                $serialNumbers = $resolveSerialNumbersForProductIds($currentOrderId, $productIds);
+                $setField('delivery_type_map', ':delivery_type_map', json_encode($normalizedMap));
+                $setField('product_id', ':product_id', (int)$productIds[0]);
+                $setField('product_ids', ':product_ids', json_encode($productIds));
+                $setField('delivery_type', ':delivery_type', reset($normalizedMap));
+                $setField('serial_numbers', ':serial_numbers', !empty($serialNumbers) ? json_encode($serialNumbers) : null);
+                $setField('serial_number', ':serial_number', !empty($serialNumbers) ? $serialNumbers[0] : null);
+
+                if ($currentOrderId > 0 && serviceOrdersHasColumn($conn, 'handover_type_map')) {
+                    $existingOrderMap = [];
+                    if (serviceOrdersHasColumn($conn, 'handover_type_map')) {
+                        $orderMapStmt = $conn->prepare("SELECT handover_type_map FROM service_orders WHERE id = :order_id LIMIT 1");
+                        $orderMapStmt->bindValue(':order_id', $currentOrderId, PDO::PARAM_INT);
+                        $orderMapStmt->execute();
+                        $orderMapRow = $orderMapStmt->fetch(PDO::FETCH_ASSOC);
+                        $existingOrderMap = parseJsonObjectSafe($orderMapRow['handover_type_map'] ?? null);
+                    }
+                    foreach ($normalizedMap as $productId => $deliveryType) {
+                        $existingOrderMap[(string)$productId] = $deliveryType;
+                    }
+                    $updateOrderFields = [];
+                    $updateOrderParams = [':order_id' => $currentOrderId, ':handover_type_map' => json_encode($existingOrderMap)];
+                    $updateOrderFields[] = "handover_type_map = :handover_type_map";
+                    if (serviceOrdersHasColumn($conn, 'handover_type')) {
+                        $updateOrderFields[] = "handover_type = :handover_type";
+                        $updateOrderParams[':handover_type'] = reset($normalizedMap);
+                    }
+                    $updateOrderStmt = $conn->prepare("UPDATE service_orders SET " . implode(', ', $updateOrderFields) . " WHERE id = :order_id");
+                    foreach ($updateOrderParams as $key => $value) {
+                        $updateOrderStmt->bindValue($key, $value);
+                    }
+                    $updateOrderStmt->execute();
+                }
+            }
+        } elseif (isset($params[':delivery_type']) && $currentProductId > 0) {
+            $existingProductIds = parseJsonArraySafe($currentDelivery['product_ids'] ?? null);
+            if (empty($existingProductIds)) {
+                $existingProductIds = [$currentProductId];
+            }
+            $normalizedMap = [];
+            foreach ($existingProductIds as $productId) {
+                $normalizedProductId = (int)$productId;
+                if ($normalizedProductId > 0) {
+                    $normalizedMap[(string)$normalizedProductId] = $params[':delivery_type'];
+                }
+            }
+            $serialNumbers = $resolveSerialNumbersForProductIds($currentOrderId, $existingProductIds);
+            $setField('delivery_type_map', ':delivery_type_map', json_encode($normalizedMap));
+            $setField('product_id', ':product_id', (int)$existingProductIds[0]);
+            $setField('product_ids', ':product_ids', json_encode(array_values(array_map('intval', $existingProductIds))));
+            $setField('serial_numbers', ':serial_numbers', !empty($serialNumbers) ? json_encode($serialNumbers) : null);
+            $setField('serial_number', ':serial_number', !empty($serialNumbers) ? $serialNumbers[0] : null);
         }
         
         if (empty($fields)) {
@@ -846,6 +1276,7 @@ function updateDelivery($conn) {
  */
 function deleteDelivery($conn) {
     try {
+        ensureDeliveriesSchemaColumns($conn);
         $id = isset($_GET['id']) ? $_GET['id'] : null;
         
         if (!$id) {
@@ -855,7 +1286,7 @@ function deleteDelivery($conn) {
         }
         
         // Check if delivery exists
-        $checkQuery = "SELECT id FROM deliveries WHERE id = :id";
+        $checkQuery = "SELECT id FROM deliveries WHERE id = :id AND COALESCE(is_deleted, 0) = 0";
         $checkStmt = $conn->prepare($checkQuery);
         $checkStmt->bindParam(':id', $id, PDO::PARAM_INT);
         $checkStmt->execute();
@@ -866,8 +1297,8 @@ function deleteDelivery($conn) {
             return;
         }
         
-        // Delete delivery
-        $query = "DELETE FROM deliveries WHERE id = :id";
+        // Soft delete delivery so delivery sync does not recreate it automatically.
+        $query = "UPDATE deliveries SET is_deleted = 1, updated_at = NOW() WHERE id = :id";
         $stmt = $conn->prepare($query);
         $stmt->bindParam(':id', $id, PDO::PARAM_INT);
         

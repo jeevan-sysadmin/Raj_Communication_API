@@ -26,6 +26,7 @@ class LoginAPI {
     private $conn;
     private $data;
     private static $usersTableChecked = false;
+    private const TOKEN_TTL_SECONDS = 180 * 24 * 60 * 60; // 180 days
 
     public function __construct() {
         $database = new Database();
@@ -91,15 +92,7 @@ class LoginAPI {
                         unset($row['password']);
                         
                         // Generate JWT token
-                        $tokenPayload = [
-                            'user_id' => $row['id'],
-                            'email' => $row['email'],
-                            'name' => $row['name'],
-                            'role' => $row['role'],
-                            'iat' => time(),
-                            'exp' => time() + (24 * 60 * 60) // 24 hours
-                        ];
-                        $token = JWT::encode($tokenPayload);
+                        $token = $this->generateToken($row);
                         
                         // Normalize role to supported values only
                         $role = $row['role'] === 'admin' ? 'admin' : 'user';
@@ -194,6 +187,20 @@ class LoginAPI {
         } catch (Exception $e) {
             error_log("Failed to update last login: " . $e->getMessage());
         }
+    }
+
+    private function generateToken(array $user): string {
+        $issuedAt = time();
+        $tokenPayload = [
+            'user_id' => $user['id'],
+            'email' => $user['email'],
+            'name' => $user['name'],
+            'role' => $user['role'],
+            'iat' => $issuedAt,
+            'exp' => $issuedAt + self::TOKEN_TTL_SECONDS,
+        ];
+
+        return JWT::encode($tokenPayload);
     }
 
     private function sendSuccess($data = []) {

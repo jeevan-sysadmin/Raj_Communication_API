@@ -20,6 +20,7 @@ require_once __DIR__ . '/config/database.php';
 class CompanyApi {
     private $conn;
     private $table = "companies";
+    private $columnCache = null;
 
     public function __construct($conn) {
         $this->conn = $conn;
@@ -27,6 +28,48 @@ class CompanyApi {
 
     private function safeText($value): string {
         return trim((string)($value ?? ''));
+    }
+
+    private function getAvailableColumns(): array {
+        if (is_array($this->columnCache)) {
+            return $this->columnCache;
+        }
+
+        $stmt = $this->conn->query("SHOW COLUMNS FROM " . $this->table);
+        $columns = [];
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $name = isset($row['Field']) ? trim((string)$row['Field']) : '';
+            if ($name !== '') {
+                $columns[] = $name;
+            }
+        }
+
+        $this->columnCache = $columns;
+        return $this->columnCache;
+    }
+
+    private function hasColumn(string $column): bool {
+        return in_array($column, $this->getAvailableColumns(), true);
+    }
+
+    private function buildSelectColumns(): string {
+        $preferred = [
+            'id',
+            'company_code',
+            'company_name',
+            'product',
+            'contact_person',
+            'phone',
+            'email',
+            'address',
+            'notes',
+            'source_pdf',
+            'created_at',
+            'updated_at',
+        ];
+
+        $available = array_values(array_filter($preferred, array($this, 'hasColumn')));
+        return implode(', ', $available);
     }
 
     private function companyCodeExists(string $companyCode): bool {
@@ -37,19 +80,26 @@ class CompanyApi {
         return (bool)$stmt->fetch();
     }
 
+    private function nextCompanyId(): int {
+        $query = "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM " . $this->table;
+        $stmt = $this->conn->query($query);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return (int)($row['next_id'] ?? 1);
+    }
+
     private function generateCompanyCode(): string {
         for ($attempt = 0; $attempt < 8; $attempt++) {
-            $code = "CMP" . date("Ymd") . strtoupper(substr(bin2hex(random_bytes(3)), 0, 6));
+            $code = "CMP" . date("Ymd") . strtoupper(substr(str_replace('.', '', uniqid('', true)), -6));
             if (!$this->companyCodeExists($code)) {
                 return $code;
             }
         }
 
-        return "CMP" . date("Ymd") . strtoupper(substr(uniqid('', true), -6));
+        return "CMP" . date("Ymd") . strtoupper(substr(str_replace('.', '', uniqid('', true)), -6));
     }
 
     public function getAll(string $search = '', string $startDate = '', string $endDate = ''): array {
-        $query = "SELECT id, company_code, company_name, product, contact_person, phone, email, address, notes, source_pdf, created_at, updated_at
+        $query = "SELECT " . $this->buildSelectColumns() . "
                   FROM " . $this->table . " WHERE 1=1";
 
         $params = [];
@@ -62,22 +112,22 @@ class CompanyApi {
                 contact_person LIKE :search OR
                 phone LIKE :search OR
                 email LIKE :search OR
-                source_pdf LIKE :search
+                " . ($this->hasColumn('source_pdf') ? "source_pdf LIKE :search" : "1=0") . "
             )";
             $params[':search'] = '%' . $search . '%';
         }
 
-        if ($startDate !== '') {
+        if ($startDate !== '' && $this->hasColumn('created_at')) {
             $query .= " AND DATE(created_at) >= :start_date";
             $params[':start_date'] = $startDate;
         }
 
-        if ($endDate !== '') {
+        if ($endDate !== '' && $this->hasColumn('created_at')) {
             $query .= " AND DATE(created_at) <= :end_date";
             $params[':end_date'] = $endDate;
         }
 
-        $query .= " ORDER BY created_at DESC";
+        $query .= $this->hasColumn('created_at') ? " ORDER BY created_at DESC" : " ORDER BY id DESC";
 
         $stmt = $this->conn->prepare($query);
         foreach ($params as $key => $value) {
@@ -89,7 +139,7 @@ class CompanyApi {
     }
 
     public function getById(int $id) {
-        $query = "SELECT id, company_code, company_name, product, contact_person, phone, email, address, notes, source_pdf, created_at, updated_at
+        $query = "SELECT " . $this->buildSelectColumns() . "
                   FROM " . $this->table . " WHERE id = :id LIMIT 1";
         $stmt = $this->conn->prepare($query);
         $stmt->bindValue(':id', $id, PDO::PARAM_INT);
@@ -113,28 +163,57 @@ class CompanyApi {
         $notes = $this->safeText($input['notes'] ?? '');
         $sourcePdf = $this->safeText($input['source_pdf'] ?? '');
 
-        $query = "INSERT INTO " . $this->table . " (
-                    company_code, company_name, product, contact_person, phone, email, address, notes, source_pdf, created_at, updated_at
-                  ) VALUES (
-                    :company_code, :company_name, :product, :contact_person, :phone, :email, :address, :notes, :source_pdf, NOW(), NOW()
-                  )";
+        $insertData = [
+            'company_code' => $companyCode,
+            'company_name' => $companyName,
+            'product' => $product,
+            'contact_person' => $contactPerson,
+            'phone' => $phone,
+            'email' => $email,
+            'address' => $address,
+            'notes' => $notes,
+        ];
+        $createdCompanyId = null;
+        if ($this->hasColumn('id')) {
+            $createdCompanyId = $this->nextCompanyId();
+            $insertData = array_merge(['id' => $createdCompanyId], $insertData);
+        }
+        if ($this->hasColumn('source_pdf')) {
+            $insertData['source_pdf'] = $sourcePdf;
+        }
+        if ($this->hasColumn('created_at')) {
+            $insertData['created_at'] = '__NOW__';
+        }
+        if ($this->hasColumn('updated_at')) {
+            $insertData['updated_at'] = '__NOW__';
+        }
+
+        $columns = array_keys($insertData);
+        $placeholders = [];
+        foreach ($columns as $column) {
+            if ($insertData[$column] === '__NOW__') {
+                $placeholders[] = 'NOW()';
+            } else {
+                $placeholders[] = ':' . $column;
+            }
+        }
+
+        $query = "INSERT INTO " . $this->table . " (" . implode(', ', $columns) . ")
+                  VALUES (" . implode(', ', $placeholders) . ")";
 
         $stmt = $this->conn->prepare($query);
-        $stmt->bindValue(':company_code', $companyCode, PDO::PARAM_STR);
-        $stmt->bindValue(':company_name', $companyName, PDO::PARAM_STR);
-        $stmt->bindValue(':product', $product, PDO::PARAM_STR);
-        $stmt->bindValue(':contact_person', $contactPerson, PDO::PARAM_STR);
-        $stmt->bindValue(':phone', $phone, PDO::PARAM_STR);
-        $stmt->bindValue(':email', $email, PDO::PARAM_STR);
-        $stmt->bindValue(':address', $address, PDO::PARAM_STR);
-        $stmt->bindValue(':notes', $notes, PDO::PARAM_STR);
-        $stmt->bindValue(':source_pdf', $sourcePdf, PDO::PARAM_STR);
+        foreach ($insertData as $column => $value) {
+            if ($value === '__NOW__') {
+                continue;
+            }
+            $stmt->bindValue(':' . $column, $value, $column === 'id' ? PDO::PARAM_INT : PDO::PARAM_STR);
+        }
 
         if ($stmt->execute()) {
             return [
                 'success' => true,
                 'message' => 'Company created successfully',
-                'company_id' => (int)$this->conn->lastInsertId(),
+                'company_id' => (int)($createdCompanyId ?: $this->conn->lastInsertId()),
                 'company_code' => $companyCode
             ];
         }
@@ -160,30 +239,43 @@ class CompanyApi {
         $email = $this->safeText($input['email'] ?? $existing['email']);
         $address = $this->safeText($input['address'] ?? $existing['address']);
         $notes = $this->safeText($input['notes'] ?? $existing['notes']);
-        $sourcePdf = $this->safeText($input['source_pdf'] ?? $existing['source_pdf']);
+        $sourcePdf = $this->safeText($input['source_pdf'] ?? ($existing['source_pdf'] ?? ''));
+
+        $updateData = [
+            'company_name' => $companyName,
+            'product' => $product,
+            'contact_person' => $contactPerson,
+            'phone' => $phone,
+            'email' => $email,
+            'address' => $address,
+            'notes' => $notes,
+        ];
+        if ($this->hasColumn('source_pdf')) {
+            $updateData['source_pdf'] = $sourcePdf;
+        }
+        if ($this->hasColumn('updated_at')) {
+            $updateData['updated_at'] = '__NOW__';
+        }
+
+        $setClauses = [];
+        foreach (array_keys($updateData) as $column) {
+            $setClauses[] = $updateData[$column] === '__NOW__'
+                ? $column . " = NOW()"
+                : $column . " = :" . $column;
+        }
 
         $query = "UPDATE " . $this->table . "
-                  SET company_name = :company_name,
-                      product = :product,
-                      contact_person = :contact_person,
-                      phone = :phone,
-                      email = :email,
-                      address = :address,
-                      notes = :notes,
-                      source_pdf = :source_pdf,
-                      updated_at = NOW()
+                  SET " . implode(",\n                      ", $setClauses) . "
                   WHERE id = :id";
 
         $stmt = $this->conn->prepare($query);
         $stmt->bindValue(':id', $id, PDO::PARAM_INT);
-        $stmt->bindValue(':company_name', $companyName, PDO::PARAM_STR);
-        $stmt->bindValue(':product', $product, PDO::PARAM_STR);
-        $stmt->bindValue(':contact_person', $contactPerson, PDO::PARAM_STR);
-        $stmt->bindValue(':phone', $phone, PDO::PARAM_STR);
-        $stmt->bindValue(':email', $email, PDO::PARAM_STR);
-        $stmt->bindValue(':address', $address, PDO::PARAM_STR);
-        $stmt->bindValue(':notes', $notes, PDO::PARAM_STR);
-        $stmt->bindValue(':source_pdf', $sourcePdf, PDO::PARAM_STR);
+        foreach ($updateData as $column => $value) {
+            if ($value === '__NOW__') {
+                continue;
+            }
+            $stmt->bindValue(':' . $column, $value, PDO::PARAM_STR);
+        }
 
         if ($stmt->execute()) {
             return ['success' => true, 'message' => 'Company updated successfully'];
@@ -312,7 +404,8 @@ try {
             echo json_encode(["success" => false, "message" => "Method not allowed"]);
             break;
     }
-} catch (Exception $e) {
+} catch (Throwable $e) {
+    error_log('companys.php fatal: ' . $e->getMessage());
     http_response_code(500);
     echo json_encode([
         "success" => false,

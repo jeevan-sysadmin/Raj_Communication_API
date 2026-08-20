@@ -122,6 +122,48 @@ function normalizeProductStatusMap($value) {
     return $map;
 }
 
+function normalizePositiveQuantity($value) {
+    $quantity = (int)$value;
+    return $quantity > 0 ? $quantity : 1;
+}
+
+function normalizeProductQuantityMap($value) {
+    if (is_array($value)) {
+        $source = $value;
+    } elseif (is_string($value)) {
+        $trimmed = trim($value);
+        if ($trimmed === '') {
+            return [];
+        }
+
+        $decoded = json_decode($trimmed, true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
+            $fixed = preg_replace('/"(\d+)"\s*\.\s*(\d+)/', '"$1":$2', $trimmed);
+            if (!is_string($fixed)) {
+                return [];
+            }
+            $decoded = json_decode($fixed, true);
+            if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
+                return [];
+            }
+        }
+        $source = $decoded;
+    } else {
+        return [];
+    }
+
+    $map = [];
+    foreach ($source as $productId => $quantity) {
+        $id = (int)$productId;
+        if ($id <= 0) {
+            continue;
+        }
+        $map[(string)$id] = normalizePositiveQuantity($quantity);
+    }
+
+    return $map;
+}
+
 function buildLatestClientByProductMap($conn, $productIds) {
     $productIds = array_values(array_unique(array_filter(array_map('intval', $productIds))));
     if (empty($productIds)) {
@@ -145,6 +187,7 @@ function buildLatestClientByProductMap($conn, $productIds) {
                      so.product_id,
                      so.product_ids,
                      so.product_status_map,
+                     so.product_quantity_map,
                      so.created_at,
                      c.full_name AS client_name,
                      c.phone AS client_phone";
@@ -173,6 +216,7 @@ function buildLatestClientByProductMap($conn, $productIds) {
 
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         $matchedProductIds = [];
+        $quantityMap = normalizeProductQuantityMap($row['product_quantity_map'] ?? []);
 
         $statusMap = normalizeProductStatusMap($row['product_status_map'] ?? []);
         foreach ($statusMap as $productId => $status) {
@@ -217,6 +261,7 @@ function buildLatestClientByProductMap($conn, $productIds) {
                 'client_phone' => (string)($row['client_phone'] ?? ''),
                 'order_id' => (int)($row['order_id'] ?? 0),
                 'order_code' => (string)($row['order_code'] ?? ''),
+                'quantity' => (int)($quantityMap[(string)$productId] ?? 1),
             ];
         }
 
@@ -290,6 +335,7 @@ try {
             'client_phone' => '',
             'order_id' => 0,
             'order_code' => '',
+            'quantity' => 1,
         ];
 
         $product['purchase_date_formatted'] = formatNullableDate($product['purchase_date']);
@@ -304,6 +350,8 @@ try {
         $product['client_phone'] = $clientInfo['client_phone'];
         $product['order_id'] = $clientInfo['order_id'];
         $product['order_code'] = $clientInfo['order_code'];
+        $product['quantity'] = (int)($clientInfo['quantity'] ?? 1);
+        $product['qty'] = (int)($clientInfo['quantity'] ?? 1);
 
         echo json_encode([
             "success" => true,
@@ -357,6 +405,7 @@ try {
             'client_phone' => '',
             'order_id' => 0,
             'order_code' => '',
+            'quantity' => 1,
         ];
 
         $product['purchase_date_formatted'] = formatNullableDate($product['purchase_date']);
@@ -371,6 +420,8 @@ try {
         $product['client_phone'] = $clientInfo['client_phone'];
         $product['order_id'] = $clientInfo['order_id'];
         $product['order_code'] = $clientInfo['order_code'];
+        $product['quantity'] = (int)($clientInfo['quantity'] ?? 1);
+        $product['qty'] = (int)($clientInfo['quantity'] ?? 1);
     }
     unset($product);
 

@@ -97,6 +97,48 @@ function normalizeProductStatusMap($value) {
     return $map;
 }
 
+function normalizePositiveQuantity($value) {
+    $quantity = (int)$value;
+    return $quantity > 0 ? $quantity : 1;
+}
+
+function normalizeProductQuantityMap($value) {
+    if (is_array($value)) {
+        $source = $value;
+    } elseif (is_string($value)) {
+        $trimmed = trim($value);
+        if ($trimmed === '') {
+            return [];
+        }
+
+        $decoded = json_decode($trimmed, true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
+            $fixed = preg_replace('/"(\d+)"\s*\.\s*(\d+)/', '"$1":$2', $trimmed);
+            if (!is_string($fixed)) {
+                return [];
+            }
+            $decoded = json_decode($fixed, true);
+            if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
+                return [];
+            }
+        }
+        $source = $decoded;
+    } else {
+        return [];
+    }
+
+    $map = [];
+    foreach ($source as $productId => $quantity) {
+        $id = (int)$productId;
+        if ($id <= 0) {
+            continue;
+        }
+        $map[(string)$id] = normalizePositiveQuantity($quantity);
+    }
+
+    return $map;
+}
+
 function containsRajToComStatus($statusMap) {
     foreach ($statusMap as $status) {
         if ($status === 'rajtocom') {
@@ -242,6 +284,7 @@ try {
 
     foreach ($rows as $row) {
         $statusMap = normalizeProductStatusMap($row['product_status_map'] ?? []);
+        $quantityMap = normalizeProductQuantityMap($row['product_quantity_map'] ?? []);
         $primaryIds = normalizeIdList($row['product_ids'] ?? []);
         if (empty($primaryIds) && isset($row['product_id']) && (int)$row['product_id'] > 0) {
             $primaryIds = [(int)$row['product_id']];
@@ -284,6 +327,7 @@ try {
         $row['replacement_product_ids'] = $replacementIds;
         $row['company_ids'] = $companyIds;
         $row['product_status_map'] = $statusMap;
+        $row['product_quantity_map'] = $quantityMap;
         $row['rajtocom_product_ids'] = !empty($rajtocomIds) ? $rajtocomIds : $rajtocomByIds;
 
         $matchedOrders[] = $row;
@@ -334,6 +378,7 @@ try {
                 'client_phone' => (string)($order['client_phone'] ?? ''),
                 'order_id' => (int)($order['order_id'] ?? 0),
                 'order_code' => (string)($order['order_code'] ?? ''),
+                'quantity' => (int)(($order['product_quantity_map'][ (string)$productId ] ?? 1)),
             ];
         }
     }
@@ -356,12 +401,15 @@ try {
                 'client_phone' => '',
                 'order_id' => 0,
                 'order_code' => '',
+                'quantity' => 1,
             ];
 
             $product['client_name'] = $clientInfo['client_name'];
             $product['client_phone'] = $clientInfo['client_phone'];
             $product['order_id'] = $clientInfo['order_id'];
             $product['order_code'] = $clientInfo['order_code'];
+            $product['quantity'] = (int)($clientInfo['quantity'] ?? 1);
+            $product['qty'] = (int)($clientInfo['quantity'] ?? 1);
         }
         unset($product);
     }
